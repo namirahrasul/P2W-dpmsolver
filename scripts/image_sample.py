@@ -43,7 +43,7 @@ def main():
     all_images = []
     all_labels = []
     count = 0
-    while count * args.batch_size < args.num_samples:
+    while count  < args.num_samples:
         model_kwargs = {}
         if args.class_cond:
             classes = th.randint(
@@ -68,7 +68,7 @@ def main():
                 out_path,
                 nrow=1,
                 normalize=True,
-                range=(-1, 1),
+                value_range=(-1, 1),
             )
         # saving npz
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
@@ -84,6 +84,7 @@ def main():
             ]
             dist.all_gather(gathered_labels, classes)
             all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
+        count += args.batch_size
         logger.log(f"created {len(all_images) * args.batch_size} samples")
 
     arr = np.concatenate(all_images, axis=0)
@@ -107,9 +108,9 @@ def main():
 def create_argparser():
     defaults = dict(
         clip_denoised=True,
-        num_samples=10000,
-        batch_size=16,
-        use_ddim=False,
+        num_samples=5,
+        batch_size=1,
+        use_ddim=True,
         model_path="",
         sample_dir="",
     )
