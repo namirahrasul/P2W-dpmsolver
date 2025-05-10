@@ -3,7 +3,24 @@ This code started out as a PyTorch port of Ho et al's diffusion models:
 https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py
 
 Docstrings have been added, as well as DDIM sampling and a new collection of beta schedules.
+Training functions:
+training_losses
+_vb_terms_bpd
+_prior_bpd
+calc_bpd_loop
+
+Sampling functions:
+p_sample
+p_sample_loop
+p_sample_loop_progressive
+ddim_sample
+ddim_reverse_sample
+ddim_sample_loop
+ddim_sample_loop_progressive
+
+Rest are used in both
 """
+
 
 import enum
 import math
