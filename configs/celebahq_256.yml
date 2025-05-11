@@ -16,12 +16,13 @@ data:
     #rescaled matches p2w where this is hardcoded to always convert [0,255[ to [-1,1]
     num_workers: 8
     #num_workers matches our mobile lab setup for p2w our checkpoint
-    num_classes: 1
+    num_classes: null
+    # was 1 originally but uncond image generation works with null.
 
 model:
     model_type: "p2-weighing"
     is_upsampling: false
-     # is_upsampling matches p2w
+    #is_upsampling matches p2w
     image_size: 256
     in_channels: 3 
     #in channels matches p2w
@@ -36,18 +37,23 @@ model:
     dropout: 0.0
     #dropout matches p2w
     channel_mult: [1, 1, 2, 2, 4, 4]
-    #channel_mult matches p2wwhen image sizze is 256
+    #channel_mult matches p2w when image size is 256
     conv_resample: true
+    # conv_resample matche p2w default but not used since reslock_updown=true
     dims: 2
+    #dims matches p2w for 2d convolution 
     num_classes: null
+    #num_classes null for image generation
     use_checkpoint: false
+    #use_checkpoint for gradient checkpointing during training. False to match default value of p2w
     use_fp16: true
     # use_fp16 matches our p2w checkpoint 
     num_heads: 1
-    #num_heads matches p2w
+    #problem: training and sampling in p2w uses default 4, m2s sampling uses 1.
     num_head_channels: 64
     #num_head_channels matches p2w
     num_heads_upsample: -1
+    #num_heads_upsample matches p2w default
     use_scale_shift_norm: true
     #use_scale_shift_norm: matches p2w
     resblock_updown: true
@@ -62,7 +68,7 @@ model:
     #ema_rate matches p2w default
     ckpt_dir: "~/ddpm_ckpt/bedroom/lsun_bedroom.pt"
 
-    ##no rscale_learned_sigma in dpmsolver unlikep2w. not needed for sampling but needed in training
+    ##no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
 
 diffusion:
 #all matches p2w
@@ -72,11 +78,11 @@ diffusion:
     num_diffusion_timesteps: 1000
 
 sampling:
-    total_N: 1000
-    batch_size: 50
+    total_N: 5
+    batch_size: 1
     last_only: True
     fid_stats_dir: "fid_stats/VIRTUAL_lsun_bedroom256.npz"
-    fid_total_samples: 50000
-    fid_batch_size: 1000
+    fid_total_samples: 5
+    fid_batch_size: 1
     cond_class: false
     classifier_scale: 0.0
