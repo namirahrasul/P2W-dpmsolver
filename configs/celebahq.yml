@@ -1,44 +1,71 @@
 data:
     dataset: "celebahq"
     category: null
+    #category not null for lsun
     image_size: 256
     channels: 3
     logit_transform: false
+    # logit_transform not in p2w 
     uniform_dequantization: false
+    # uniform_dequantization not in p2w 
     gaussian_dequantization: false
+    #gaussian_dequantization not in p2w
     random_flip: true
+    #random_flip matches p2w
     rescaled: true
-    num_workers: 8 #matches our mobile lab setup
+    #rescaled matches p2w where this is hardcoded to always convert [0,255[ to [-1,1]
+    num_workers: 8
+    #num_workers matches our mobile lab setup for p2w our checkpoint
     num_classes: 1
 
 model:
     model_type: "p2-weighing"
-    is_upsampling: false #matches p2w
+    is_upsampling: false
+     # is_upsampling matches p2w
     image_size: 256
-    in_channels: 3 #matches p2w
-    model_channels: 128 #matches num_channels in p2w
-    out_channels: 6 #matches p2w
-    num_res_blocks: 1 #matches p2w
-    attention_resolutions: 16 #matches p2w
-    dropout: 0.0 #matches p2w
-    channel_mult: [1, 1, 2, 2, 4, 4] #matches p2w
+    in_channels: 3 
+    #in channels matches p2w
+    model_channels: 128
+    #model_channels matches num_channels in p2w
+    out_channels: 6
+    #out_channels matches p2w; 3 if learned_sigma=false
+    num_res_blocks: 1
+    #num_res_blocks matches p2w
+    attention_resolutions: 16
+    #attention_resolutions matches p2w
+    dropout: 0.0
+    #dropout matches p2w
+    channel_mult: [1, 1, 2, 2, 4, 4]
+    #channel_mult matches p2wwhen image sizze is 256
     conv_resample: true
     dims: 2
     num_classes: null
     use_checkpoint: false
-    use_fp16: true #matches our p2w checkpoint 
-    num_heads: 1 #matches p2w
-    num_head_channels: 64 #matches p2w
+    use_fp16: true
+    # use_fp16 matches our p2w checkpoint 
+    num_heads: 1
+    #num_heads matches p2w
+    num_head_channels: 64
+    #num_head_channels matches p2w
     num_heads_upsample: -1
-    use_scale_shift_norm: true #matches p2w
-    resblock_updown: true #matches p2w
-    use_new_attention_order: false #matches p2w
-    var_type: fixedlarge #matches p2w
-    ema: true #matches p2w
-    ema_rate: 0.9999 #matches p2w
+    use_scale_shift_norm: true
+    #use_scale_shift_norm: matches p2w
+    resblock_updown: true
+    #resblock_updown matches p2w
+    use_new_attention_order: false
+    #use_new_attention_order matches p2w default
+    var_type: fixedlarge
+    #var_type matches p2w for ddim ;p2w learned for ddpm sampling when learned_sigma=true; no learned option in dpmsolver
+    ema: true
+    #ema matches p2w where no ema only ema_rate
+    ema_rate: 0.9999
+    #ema_rate matches p2w default
     ckpt_dir: "~/ddpm_ckpt/bedroom/lsun_bedroom.pt"
 
-diffusion: #all matches p2w
+    ##no rscale_learned_sigma in dpmsolver unlikep2w. not needed for sampling but needed in training
+
+diffusion:
+#all matches p2w
     beta_schedule: linear
     beta_start: 0.0001
     beta_end: 0.02
