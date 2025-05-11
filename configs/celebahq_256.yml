@@ -13,7 +13,7 @@ data:
     random_flip: true
     #random_flip matches p2w
     rescaled: true
-    #rescaled matches p2w where this is hardcoded to always convert [0,255[ to [-1,1]
+    #rescaled matches p2w where this is hardcoded to always convert [0,255] to [-1,1]
     num_workers: 8
     #num_workers matches our mobile lab setup for p2w our checkpoint
     num_classes: null
@@ -39,7 +39,7 @@ model:
     channel_mult: [1, 1, 2, 2, 4, 4]
     #channel_mult matches p2w when image size is 256
     conv_resample: true
-    # conv_resample matche p2w default but not used since reslock_updown=true
+    # conv_resample matche p2w default but not used since resblock_updown=true
     dims: 2
     #dims matches p2w for 2d convolution 
     num_classes: null
@@ -49,7 +49,7 @@ model:
     use_fp16: true
     # use_fp16 matches our p2w checkpoint 
     num_heads: 1
-    #problem: training and sampling in p2w uses default 4, m2s sampling uses 1.
+    #problem: training and sampling in p2w uses default 4, m2s sampling uses 1. grok suggest our_checkpoint actually is 8 and says num_heads =1 will give fastest inference but sacrifice quality
     num_head_channels: 64
     #num_head_channels matches p2w
     num_heads_upsample: -1
