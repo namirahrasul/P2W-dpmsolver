@@ -1,5 +1,5 @@
 data:
-    dataset: "celebahq"
+    dataset: "CELEBA"
     category: null
     #category not null for lsun
     image_size: 256
