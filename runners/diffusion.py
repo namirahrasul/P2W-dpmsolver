@@ -13,8 +13,7 @@ import torch.utils.data as data
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from models.diffusion import Model
-from models.improved_ddpm.unet import UNetModel as ImprovedDDPM_Model
+from models.p2_weighing.unet import UNetModel as LWDM_Model
 from models.guided_diffusion.unet import UNetModel as GuidedDiffusion_Model
 from models.guided_diffusion.unet import EncoderUNetModel as GuidedDiffusion_Classifier
 from models.guided_diffusion.unet import SuperResModel as GuidedDiffusion_SRModel
@@ -51,8 +50,7 @@ def load_data_for_worker(base_samples, batch_size, cond_class):
                 yield res
                 buffer, label_buffer = [], []
 
-
-def torch2hwcuint8(x, clip=False):
+def torch2hwcuint8(x, clip=False): # dont know function (training or sampling)
     if clip:
         x = torch.clamp(x, -1, 1)
     x = (x + 1.0) / 2.0
@@ -156,116 +154,30 @@ class Diffusion(object):
         elif self.model_var_type == "fixedsmall":
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
-    def train(self):
-        args, config = self.args, self.config
-        tb_logger = self.config.tb_logger
-        dataset, test_dataset = get_dataset(args, config)
-        train_loader = data.DataLoader(
-            dataset,
-            batch_size=config.training.batch_size,
-            shuffle=True,
-            num_workers=config.data.num_workers,
-        )
-        model = Model(config)
-
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
-
-        optimizer = get_optimizer(self.config, model.parameters())
-
-        if self.config.model.ema:
-            ema_helper = EMAHelper(mu=self.config.model.ema_rate)
-            ema_helper.register(model)
-        else:
-            ema_helper = None
-
-        start_epoch, step = 0, 0
-        if self.args.resume_training:
-            states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"))
-            model.load_state_dict(states[0])
-
-            states[1]["param_groups"][0]["eps"] = self.config.optim.eps
-            optimizer.load_state_dict(states[1])
-            start_epoch = states[2]
-            step = states[3]
-            if self.config.model.ema:
-                ema_helper.load_state_dict(states[4])
-
-        for epoch in range(start_epoch, self.config.training.n_epochs):
-            data_start = time.time()
-            data_time = 0
-            for i, (x, y) in enumerate(train_loader):
-                n = x.size(0)
-                data_time += time.time() - data_start
-                model.train()
-                step += 1
-
-                x = x.to(self.device)
-                x = data_transform(self.config, x)
-                e = torch.randn_like(x)
-                b = self.betas
-
-                # antithetic sampling
-                t = torch.randint(
-                    low=0, high=self.num_timesteps, size=(n // 2 + 1,)
-                ).to(self.device)
-                t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-                loss = loss_registry[config.model.type](model, x, t, e, b)
-
-                tb_logger.add_scalar("loss", loss, global_step=step)
-
-                logging.info(
-                    f"step: {step}, loss: {loss.item()}, data time: {data_time / (i+1)}"
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-
-                try:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), config.optim.grad_clip
-                    )
-                except Exception:
-                    pass
-                optimizer.step()
-
-                if self.config.model.ema:
-                    ema_helper.update(model)
-
-                if step % self.config.training.snapshot_freq == 0 or step == 1:
-                    states = [
-                        model.state_dict(),
-                        optimizer.state_dict(),
-                        epoch,
-                        step,
-                    ]
-                    if self.config.model.ema:
-                        states.append(ema_helper.state_dict())
-
-                    torch.save(
-                        states,
-                        os.path.join(self.args.log_path, "ckpt_{}.pth".format(step)),
-                    )
-                    torch.save(states, os.path.join(self.args.log_path, "ckpt.pth"))
-
-                data_start = time.time()
-
     def sample(self):
-        if self.config.model.model_type == 'improved_ddpm':
-            model = ImprovedDDPM_Model(
-                in_channels=self.config.model.in_channels,
-                model_channels=self.config.model.model_channels,
-                out_channels=self.config.model.out_channels,
-                num_res_blocks=self.config.model.num_res_blocks,
-                attention_resolutions=self.config.model.attention_resolutions,
-                dropout=self.config.model.dropout,
-                channel_mult=self.config.model.channel_mult,
-                conv_resample=self.config.model.conv_resample,
-                dims=self.config.model.dims,
-                use_checkpoint=self.config.model.use_checkpoint,
-                num_heads=self.config.model.num_heads,
-                num_heads_upsample=self.config.model.num_heads_upsample,
-                use_scale_shift_norm=self.config.model.use_scale_shift_norm
+        if self.config.model.model_type == 'p2-weighing':
+            model = LWDM_Model(
+                    image_size=self.config.model.image_size,
+                    in_channels=self.config.model.in_channels,
+                    model_channels=self.config.model.model_channels,
+                    out_channels=self.config.model.out_channels,
+                    num_res_blocks=self.config.model.num_res_blocks,
+                    attention_resolutions=self.config.model.attention_resolutions,
+                    dropout=self.config.model.dropout,
+                    channel_mult=self.config.model.channel_mult,
+                    conv_resample=self.config.model.conv_resample,
+                    dims=self.config.model.dims,
+                    num_classes=self.config.model.num_classes,
+                    use_checkpoint=self.config.model.use_checkpoint,
+                    use_fp16=self.config.model.use_fp16,
+                    num_heads=self.config.model.num_heads,
+                    num_head_channels=self.config.model.num_head_channels,
+                    num_heads_upsample=self.config.model.num_heads_upsample,
+                    use_scale_shift_norm=self.config.model.use_scale_shift_norm,
+                    resblock_updown=self.config.model.resblock_updown,
+                    use_new_attention_order=self.config.model.use_new_attention_order,
+                    p2_gamma=self.config.model.p2_gamma,
+                    p2_k=self.config.model.p2_k
             )
         elif self.config.model.model_type == "guided_diffusion":
             if self.config.model.is_upsampling:
@@ -312,8 +224,6 @@ class Diffusion(object):
                     resblock_updown=self.config.model.resblock_updown,
                     use_new_attention_order=self.config.model.use_new_attention_order,
                 )
-        else:
-            model = Model(self.config)
 
         model = model.to(self.rank)
         map_location = {'cuda:%d' % 0: 'cuda:%d' % self.rank}
@@ -373,18 +283,7 @@ class Diffusion(object):
             else:
                 classifier = None
         else:
-            classifier = None
-            # This used the pretrained DDPM model, see https://github.com/pesser/pytorch_diffusion
-            if self.config.data.dataset == "CIFAR10":
-                name = "cifar10"
-            elif self.config.data.dataset == "LSUN":
-                name = f"lsun_{self.config.data.category}"
-            else:
-                raise ValueError
-            ckpt = get_ckpt_path(f"ema_{name}")
-            if self.rank == 0:
-                print("Loading checkpoint {}".format(ckpt))
-            model.load_state_dict(torch.load(ckpt, map_location=map_location))
+           raise NotImplementedError("ckpt_dir not defined")
 
         model.eval()
 
@@ -397,7 +296,7 @@ class Diffusion(object):
                     fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=8)
                     print("FID: {}".format(fid))
                     np.save(os.path.join(self.args.exp, "fid"), fid)
-        # elif self.args.interpolation:
+        # elif self.args.interpolation: #all commented out by authors
         #     self.sample_interpolation(model)
         # elif self.args.sequence:
         #     self.sample_sequence(model)

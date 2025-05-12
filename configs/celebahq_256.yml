@@ -63,6 +63,8 @@ model:
     #use_new_attention_order matches p2w default
     var_type: fixedlarge
     #var_type matches p2w for ddim ;p2w learned for ddpm sampling when learned_sigma=true; no learned option in dpmsolver
+    p2_gamma: 1
+    p2_k: 1
     ema: true
     #ema matches p2w where no ema only ema_rate
     ema_rate: 0.9999
