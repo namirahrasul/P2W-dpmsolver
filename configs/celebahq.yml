@@ -69,7 +69,7 @@ model:
     #ema matches p2w where no ema only ema_rate
     ema_rate: 0.9999
     #ema_rate matches p2w default
-    ckpt_dir: "./ddpm_ckpt/celebahq/256x256.pt"
+    ckpt_dir: "./ddpm_ckpt/celeba/256x256.pt"
 
     ##no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
 
