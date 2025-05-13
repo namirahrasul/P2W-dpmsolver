@@ -175,9 +175,9 @@ class Diffusion(object):
                     num_heads_upsample=self.config.model.num_heads_upsample,
                     use_scale_shift_norm=self.config.model.use_scale_shift_norm,
                     resblock_updown=self.config.model.resblock_updown,
-                    use_new_attention_order=self.config.model.use_new_attention_order,
-                    p2_gamma=self.config.model.p2_gamma,
-                    p2_k=self.config.model.p2_k
+                    use_new_attention_order=self.config.model.use_new_attention_order
+                    #p2_gamma=self.config.model.p2_gamma,
+                    #p2_k=self.config.model.p2_k
             )
         elif self.config.model.model_type == "guided_diffusion":
             if self.config.model.is_upsampling:
