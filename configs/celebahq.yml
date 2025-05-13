@@ -33,7 +33,7 @@ model:
     #out_channels matches p2w; 3 if learned_sigma=false
     num_res_blocks: 1
     #num_res_blocks matches p2w
-    attention_resolutions: 16
+    attention_resolutions: [16]
     #attention_resolutions matches p2w
     dropout: 0.0
     #dropout matches p2w
