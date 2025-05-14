@@ -241,6 +241,7 @@ class Diffusion(object):
                     model.convert_to_fp16()
             else:
                 # TODO: FIXME
+                #hello
                 # model = torch.nn.DataParallel(model)
                 # model.load_state_dict(states[0], strict=True)
                 model.load_state_dict(states, strict=True)
