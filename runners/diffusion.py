@@ -296,6 +296,12 @@ class Diffusion(object):
                     fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=8)
                     print("FID: {}".format(fid))
                     np.save(os.path.join(self.args.exp, "fid"), fid)
+        elif self.args.sample_only:
+            if not os.path.exists(os.path.join(self.args.exp, "fid.npy")):
+                self.sample_n_images(model, classifier=classifier)
+                torch.distributed.barrier()
+                if self.rank == 0:
+                    print("Begin to compute samples...")
         # elif self.args.interpolation: #all commented out by authors
         #     self.sample_interpolation(model)
         # elif self.args.sequence:
@@ -357,6 +363,59 @@ class Diffusion(object):
         # # Remove the time evaluation of the first batch, because it contains extra initializations
         # print('time / batch', np.mean(t_list[1:]) / 1000., 'std', np.std(t_list[1:]) / 1000.)
 
+    def sample_n_images(self, model, classifier=None):
+        config = self.config
+        total_n_samples = config.sampling.total_samples
+        world_size = torch.cuda.device_count()
+        if total_n_samples % config.sampling.batch_size != 0:
+            raise ValueError("Total samples for sampling must be divided exactly by config.sampling.batch_size, but got {} and {}".format(total_n_samples, config.sampling.batch_size))
+        if len(glob.glob(f"{self.args.image_folder}/*.png")) == total_n_samples:
+            return
+        else:
+            n_rounds = total_n_samples // config.sampling.batch_size // world_size
+        img_id = self.rank * total_n_samples // world_size
+
+        if self.config.model.is_upsampling:
+            base_samples_total = load_data_for_worker(self.args.base_samples, config.sampling.batch_size, config.sampling.cond_class)
+
+        with torch.no_grad():
+            for _ in tqdm.tqdm(
+                range(n_rounds), desc="Generating image samples for FID evaluation."
+            ):
+                # torch.cuda.synchronize()
+                # start = torch.cuda.Event(enable_timing=True)
+                # end = torch.cuda.Event(enable_timing=True)
+                # start.record()
+
+                n = config.sampling.batch_size
+                x = torch.randn(
+                    n,
+                    config.data.channels,
+                    config.data.image_size,
+                    config.data.image_size,
+                    device=self.device,
+                )
+
+                if self.config.model.is_upsampling:
+                    base_samples = next(base_samples_total)
+                else:
+                    base_samples = None
+
+                x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples)
+
+                # end.record()
+                # torch.cuda.synchronize()
+                # t_list.append(start.elapsed_time(end))
+                x = inverse_data_transform(config, x)
+                for i in range(x.shape[0]):
+                    if classes is None:
+                        path = os.path.join(self.args.image_folder, f"{img_id}.png")
+                    else:
+                        path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
+                    tvu.save_image(x.cpu()[i], path)
+                    img_id += 1
+        # # Remove the time evaluation of the first batch, because it contains extra initializations
+        # print('time / batch', np.mean(t_list[1:]) / 1000., 'std', np.std(t_list[1:]) / 1000.)
     def sample_sequence(self, model, classifier=None):
         config = self.config
 

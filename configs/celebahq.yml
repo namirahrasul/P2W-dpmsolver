@@ -86,6 +86,7 @@ sampling:
     last_only: True
     fid_stats_dir: "./fid_stats/VIRTUAL_lsun_bedroom256.npz"
     fid_total_samples: 5
+    total_samples: 5 #for sample_n_images()
     fid_batch_size: 1
     cond_class: false
     classifier_scale: 0.0
