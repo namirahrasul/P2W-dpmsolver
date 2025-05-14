@@ -297,11 +297,11 @@ class Diffusion(object):
                     print("FID: {}".format(fid))
                     np.save(os.path.join(self.args.exp, "fid"), fid)
         elif self.args.sample_only:
-            if not os.path.exists(os.path.join(self.args.exp, "fid.npy")):
-                self.sample_n_images(model, classifier=classifier)
-                torch.distributed.barrier()
-                if self.rank == 0:
-                    print("Begin to compute samples...")
+            
+            self.sample_n_images(model, classifier=classifier)
+            torch.distributed.barrier()
+            if self.rank == 0:
+                print("Begin to compute samples...")
         # elif self.args.interpolation: #all commented out by authors
         #     self.sample_interpolation(model)
         # elif self.args.sequence:

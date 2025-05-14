@@ -51,6 +51,7 @@ def parse_args_and_config():
     )
     parser.add_argument("--fid", action="store_true")
     parser.add_argument("--interpolation", action="store_true")
+    parser.add_argument("--sample_only", action="store_true")
     parser.add_argument(
         "--resume_training", action="store_true", help="Whether to resume training"
     )
@@ -202,7 +203,7 @@ def parse_args_and_config():
             if not os.path.exists(args.image_folder):
                 os.makedirs(args.image_folder)
             else:
-                if not (args.fid or args.interpolation):
+                if not (args.fid or args.interpolation or args.sample_only):
                     overwrite = False
                     if args.ni:
                         overwrite = True
