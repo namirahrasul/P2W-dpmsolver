@@ -158,54 +158,6 @@ class Diffusion(object):
                 model_channels=self.config.model.model_channels,
                 out_channels=self.config.model.out_channels,
                 num_res_blocks=self.config.model.num_res_blocks,
-                attention_resolutions=self.config.model.aclass Diffusion(object):
-    def __init__(self, args, config, rank=None):
-        self.args = args
-        self.config = config
-        if rank is None:
-            device = (
-                torch.device("cuda")
-                if torch.cuda.is_available()
-                else torch.device("cpu")
-            )
-        else:
-            device = rank
-            self.rank = rank
-        self.device = device
-
-        self.model_var_type = config.model.var_type
-        betas = get_beta_schedule(
-            beta_schedule=config.diffusion.beta_schedule,
-            beta_start=config.diffusion.beta_start,
-            beta_end=config.diffusion.beta_end,
-            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
-        )
-        betas = self.betas = torch.from_numpy(betas).float().to(self.device)
-        self.num_timesteps = betas.shape[0]
-
-        alphas = 1.0 - betas
-        alphas_cumprod = alphas.cumprod(dim=0)
-        alphas_cumprod_prev = torch.cat(
-            [torch.ones(1).to(device), alphas_cumprod[:-1]], dim=0
-        )
-        posterior_variance = (
-            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        )
-        if self.model_var_type == "fixedlarge":
-            self.logvar = betas.log()
-            # torch.cat(
-            # [posterior_variance[1:2], betas[1:]], dim=0).log()
-        elif self.model_var_type == "fixedsmall":
-            self.logvar = posterior_variance.clamp(min=1e-20).log()
-
-    def sample(self):
-        if self.config.model.model_type == "p2-weighing":
-            model = LWDM_Model(
-                image_size=self.config.model.image_size,
-                in_channels=self.config.model.in_channels,
-                model_channels=self.config.model.model_channels,
-                out_channels=self.config.model.out_channels,
-                num_res_blocks=self.config.model.num_res_blocks,
                 attention_resolutions=self.config.model.attention_resolutions,
                 dropout=self.config.model.dropout,
                 channel_mult=self.config.model.channel_mult,
@@ -341,12 +293,8 @@ class Diffusion(object):
             torch.distributed.barrier()
             if self.rank == 0:
                 print("Begin to compute samples...")
-        # elif self.args.interpolation: #all commented out by authors
-        #     self.sample_interpolation(model)
-        # elif self.args.sequence:
-        #     self.sample_sequence(model)
         else:
-            raise NotImplementedError("Sample procedeure not defined")
+            raise NotImplementedError("Sample procedure not defined")
 
     def sample_fid(self, model, classifier=None):
         config = self.config
