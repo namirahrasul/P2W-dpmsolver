@@ -26,7 +26,6 @@ from evaluate.fid_score import calculate_fid_given_paths
 
 import torchvision.utils as tvu
 
-
 def load_data_for_worker(base_samples, batch_size, cond_class):
     with bf.BlobFile(base_samples, "rb") as f:
         obj = np.load(f)
@@ -50,12 +49,11 @@ def load_data_for_worker(base_samples, batch_size, cond_class):
                 yield res
                 buffer, label_buffer = [], []
 
-def torch2hwcuint8(x, clip=False): # dont know function (training or sampling)
+def torch2hwcuint8(x, clip=False):
     if clip:
         x = torch.clamp(x, -1, 1)
     x = (x + 1.0) / 2.0
     return x
-
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     """
@@ -75,7 +73,6 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
 
-
 def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
     def sigmoid(x):
         return 1 / (np.exp(-x) + 1)
@@ -94,14 +91,14 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         betas = np.linspace(
             beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
         )
-    elif beta_schedule == 'cosine':
+    elif beta_schedule == "cosine":
         return betas_for_alpha_bar(
             num_diffusion_timesteps,
             lambda t: np.cos((t + 0.008) / 1.008 * np.pi / 2) ** 2,
         )
     elif beta_schedule == "const":
         betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
-    elif beta_schedule == "jsd":  # 1/T, 1/(T-1), 1/(T-2), ..., 1
+    elif beta_schedule == "jsd":  # 1/T, 1/(T-2), ..., 1
         betas = 1.0 / np.linspace(
             num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64
         )
@@ -112,7 +109,6 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         raise NotImplementedError(beta_schedule)
     assert betas.shape == (num_diffusion_timesteps,)
     return betas
-
 
 class Diffusion(object):
     def __init__(self, args, config, rank=None):
@@ -155,29 +151,77 @@ class Diffusion(object):
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
     def sample(self):
-        if self.config.model.model_type == 'p2-weighing':
+        if self.config.model.model_type == "p2-weighing":
             model = LWDM_Model(
-                    image_size=self.config.model.image_size,
-                    in_channels=self.config.model.in_channels,
-                    model_channels=self.config.model.model_channels,
-                    out_channels=self.config.model.out_channels,
-                    num_res_blocks=self.config.model.num_res_blocks,
-                    attention_resolutions=self.config.model.attention_resolutions,
-                    dropout=self.config.model.dropout,
-                    channel_mult=self.config.model.channel_mult,
-                    conv_resample=self.config.model.conv_resample,
-                    dims=self.config.model.dims,
-                    num_classes=self.config.model.num_classes,
-                    use_checkpoint=self.config.model.use_checkpoint,
-                    use_fp16=self.config.model.use_fp16,
-                    num_heads=self.config.model.num_heads,
-                    num_head_channels=self.config.model.num_head_channels,
-                    num_heads_upsample=self.config.model.num_heads_upsample,
-                    use_scale_shift_norm=self.config.model.use_scale_shift_norm,
-                    resblock_updown=self.config.model.resblock_updown,
-                    use_new_attention_order=self.config.model.use_new_attention_order
-                    #p2_gamma=self.config.model.p2_gamma,
-                    #p2_k=self.config.model.p2_k
+                image_size=self.config.model.image_size,
+                in_channels=self.config.model.in_channels,
+                model_channels=self.config.model.model_channels,
+                out_channels=self.config.model.out_channels,
+                num_res_blocks=self.config.model.num_res_blocks,
+                attention_resolutions=self.config.model.aclass Diffusion(object):
+    def __init__(self, args, config, rank=None):
+        self.args = args
+        self.config = config
+        if rank is None:
+            device = (
+                torch.device("cuda")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        else:
+            device = rank
+            self.rank = rank
+        self.device = device
+
+        self.model_var_type = config.model.var_type
+        betas = get_beta_schedule(
+            beta_schedule=config.diffusion.beta_schedule,
+            beta_start=config.diffusion.beta_start,
+            beta_end=config.diffusion.beta_end,
+            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
+        )
+        betas = self.betas = torch.from_numpy(betas).float().to(self.device)
+        self.num_timesteps = betas.shape[0]
+
+        alphas = 1.0 - betas
+        alphas_cumprod = alphas.cumprod(dim=0)
+        alphas_cumprod_prev = torch.cat(
+            [torch.ones(1).to(device), alphas_cumprod[:-1]], dim=0
+        )
+        posterior_variance = (
+            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        if self.model_var_type == "fixedlarge":
+            self.logvar = betas.log()
+            # torch.cat(
+            # [posterior_variance[1:2], betas[1:]], dim=0).log()
+        elif self.model_var_type == "fixedsmall":
+            self.logvar = posterior_variance.clamp(min=1e-20).log()
+
+    def sample(self):
+        if self.config.model.model_type == "p2-weighing":
+            model = LWDM_Model(
+                image_size=self.config.model.image_size,
+                in_channels=self.config.model.in_channels,
+                model_channels=self.config.model.model_channels,
+                out_channels=self.config.model.out_channels,
+                num_res_blocks=self.config.model.num_res_blocks,
+                attention_resolutions=self.config.model.attention_resolutions,
+                dropout=self.config.model.dropout,
+                channel_mult=self.config.model.channel_mult,
+                conv_resample=self.config.model.conv_resample,
+                dims=self.config.model.dims,
+                num_classes=self.config.model.num_classes,
+                use_checkpoint=self.config.model.use_checkpoint,
+                use_fp16=self.config.model.use_fp16,
+                num_heads=self.config.model.num_heads,
+                num_head_channels=self.config.model.num_head_channels,
+                num_heads_upsample=self.config.model.num_heads_upsample,
+                use_scale_shift_norm=self.config.model.use_scale_shift_norm,
+                resblock_updown=self.config.model.resblock_updown,
+                use_new_attention_order=self.config.model.use_new_attention_order
+                #p2_gamma=self.config.model.p2_gamma,
+                #p2_k=self.config.model.p2_k
             )
         elif self.config.model.model_type == "guided_diffusion":
             if self.config.model.is_upsampling:
@@ -226,7 +270,7 @@ class Diffusion(object):
                 )
 
         model = model.to(self.rank)
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % self.rank}
+        map_location = {"cuda:%d" % 0: "cuda:%d" % self.rank}
 
         if "ckpt_dir" in self.config.model.__dict__.keys():
             ckpt_dir = os.path.expanduser(self.config.model.ckpt_dir)
@@ -234,24 +278,23 @@ class Diffusion(object):
                 ckpt_dir,
                 map_location=map_location
             )
-            # states = {f"module.{k}":v for k, v in states.items()}
-            if self.config.model.model_type == 'improved_ddpm' or self.config.model.model_type == 'guided_diffusion':
+            if self.config.model.model_type == "p2-weighing" or self.config.model.model_type == "guided_diffusion":
                 model.load_state_dict(states, strict=True)
                 if self.config.model.use_fp16:
                     model.convert_to_fp16()
             else:
-                # TODO: FIXME
-                # model = torch.nn.DataParallel(model)
-                # model.load_state_dict(states[0], strict=True)
                 model.load_state_dict(states, strict=True)
 
-            if self.config.model.ema: # for celeba 64x64 in DDIM
-                ema_helper = EMAHelper(mu=self.config.model.ema_rate)
-                ema_helper.register(model)
-                ema_helper.load_state_dict(states[-1])
-                ema_helper.ema(model)
+            if self.config.model.model_type == "p2-weighing":
+                model.load_state_dict(states, strict=True)
             else:
-                ema_helper = None
+                if self.config.model.ema:
+                    ema_helper = EMAHelper(mu=self.config.model.ema_rate)
+                    ema_helper.register(model)
+                    ema_helper.load_state_dict(states[-1])
+                    ema_helper.ema(model)
+                else:
+                    ema_helper = None
 
             if self.config.sampling.cond_class and not self.config.model.is_upsampling:
                 classifier = GuidedDiffusion_Classifier(
@@ -273,17 +316,14 @@ class Diffusion(object):
                     ckpt_dir,
                     map_location=map_location,
                 )
-                # states = {f"module.{k}":v for k, v in states.items()}
                 classifier = classifier.to(self.rank)
-                # classifier = DDP(classifier, device_ids=[self.rank])
                 classifier.load_state_dict(states, strict=True)
                 if self.config.classifier.use_fp16:
                     classifier.convert_to_fp16()
-                    # classifier.module.convert_to_fp16()
             else:
                 classifier = None
         else:
-           raise NotImplementedError("ckpt_dir not defined")
+            raise NotImplementedError("ckpt_dir not defined")
 
         model.eval()
 
@@ -293,11 +333,10 @@ class Diffusion(object):
                 torch.distributed.barrier()
                 if self.rank == 0:
                     print("Begin to compute FID...")
-                    fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=8)
+                    fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=4)
                     print("FID: {}".format(fid))
                     np.save(os.path.join(self.args.exp, "fid"), fid)
         elif self.args.sample_only:
-            
             self.sample_n_images(model, classifier=classifier)
             torch.distributed.barrier()
             if self.rank == 0:
@@ -328,11 +367,6 @@ class Diffusion(object):
             for _ in tqdm.tqdm(
                 range(n_rounds), desc="Generating image samples for FID evaluation."
             ):
-                # torch.cuda.synchronize()
-                # start = torch.cuda.Event(enable_timing=True)
-                # end = torch.cuda.Event(enable_timing=True)
-                # start.record()
-
                 n = config.sampling.batch_size
                 x = torch.randn(
                     n,
@@ -348,10 +382,6 @@ class Diffusion(object):
                     base_samples = None
 
                 x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples)
-
-                # end.record()
-                # torch.cuda.synchronize()
-                # t_list.append(start.elapsed_time(end))
                 x = inverse_data_transform(config, x)
                 for i in range(x.shape[0]):
                     if classes is None:
@@ -360,8 +390,6 @@ class Diffusion(object):
                         path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
                     tvu.save_image(x.cpu()[i], path)
                     img_id += 1
-        # # Remove the time evaluation of the first batch, because it contains extra initializations
-        # print('time / batch', np.mean(t_list[1:]) / 1000., 'std', np.std(t_list[1:]) / 1000.)
 
     def sample_n_images(self, model, classifier=None):
         config = self.config
@@ -382,11 +410,6 @@ class Diffusion(object):
             for _ in tqdm.tqdm(
                 range(n_rounds), desc="Generating image samples for FID evaluation."
             ):
-                # torch.cuda.synchronize()
-                # start = torch.cuda.Event(enable_timing=True)
-                # end = torch.cuda.Event(enable_timing=True)
-                # start.record()
-
                 n = config.sampling.batch_size
                 x = torch.randn(
                     n,
@@ -402,10 +425,6 @@ class Diffusion(object):
                     base_samples = None
 
                 x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples)
-
-                # end.record()
-                # torch.cuda.synchronize()
-                # t_list.append(start.elapsed_time(end))
                 x = inverse_data_transform(config, x)
                 for i in range(x.shape[0]):
                     if classes is None:
@@ -414,8 +433,7 @@ class Diffusion(object):
                         path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
                     tvu.save_image(x.cpu()[i], path)
                     img_id += 1
-        # # Remove the time evaluation of the first batch, because it contains extra initializations
-        # print('time / batch', np.mean(t_list[1:]) / 1000., 'std', np.std(t_list[1:]) / 1000.)
+
     def sample_sequence(self, model, classifier=None):
         config = self.config
 
@@ -427,7 +445,6 @@ class Diffusion(object):
             device=self.device,
         )
 
-        # NOTE: This means that we are producing each predicted x0, not x_{t-1} at timestep t.
         with torch.no_grad():
             _, x = self.sample_image(x, model, last=False, classifier=classifier)
 
@@ -471,7 +488,6 @@ class Diffusion(object):
         x = torch.cat(z_, dim=0)
         xs = []
 
-        # Hard coded here, modify to your preferences
         with torch.no_grad():
             for i in range(0, x.size(0), 8):
                 xs.append(self.sample_image(x[i : i + 8], model))
@@ -553,8 +569,6 @@ class Diffusion(object):
             from dpm_solver.sampler import NoiseScheduleVP, model_wrapper, DPM_Solver
             def model_fn(x, t, **model_kwargs):
                 out = model(x, t, **model_kwargs)
-                # If the model outputs both 'mean' and 'variance' (such as improved-DDPM and guided-diffusion),
-                # We only use the 'mean' output for DPM-Solver, because DPM-Solver is based on diffusion ODEs.
                 if "out_channels" in self.config.model.__dict__.keys():
                     if self.config.model.out_channels == 6:
                         out = torch.split(out, 3, dim=1)[0]
@@ -565,7 +579,7 @@ class Diffusion(object):
                 log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                 return log_probs[range(len(logits)), y.view(-1)]
 
-            noise_schedule = NoiseScheduleVP(schedule='discrete', betas=self.betas)
+            noise_schedule = NoiseScheduleVP(schedule="discrete", betas=self.betas)
             model_fn_continuous = model_wrapper(
                 model_fn,
                 noise_schedule,
@@ -595,7 +609,6 @@ class Diffusion(object):
                 atol=self.args.dpm_solver_atol,
                 rtol=self.args.dpm_solver_rtol,
             )
-            # x = x.cpu()
         else:
             raise NotImplementedError
         return x, classes

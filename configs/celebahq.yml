@@ -49,7 +49,7 @@ model:
     #use_checkpoint for gradient checkpointing during training. False to match default value of p2w
     use_fp16: true
     # use_fp16 matches our p2w checkpoint 
-    num_heads: 1
+    num_heads: 8
     #problem: training and sampling in p2w uses default 4, m2s sampling uses 1. grok suggest our_checkpoint actually is 8 and says num_heads =1 will give fastest inference but sacrifice quality
     num_head_channels: 64
     #num_head_channels matches p2w
