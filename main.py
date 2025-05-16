@@ -83,7 +83,8 @@ def parse_args_and_config():
         "--base_samples",
         type=str,
         default=None,
-        help="base samples for upsampling, *.npz",
+        help=
+        "base samples for upsampling and inpainting, *.npz",
     )
     parser.add_argument(
         "--timesteps", type=int, default=1000, help="number of steps involved"
@@ -127,6 +128,11 @@ def parse_args_and_config():
     parser.add_argument("--port", type=str, default="12355")
     parser.add_argument("--p2_gamma", type=float, default=1.0, help="P2 Weighing gamma parameter")
     parser.add_argument("--p2_k", type=float, default=1.0, help="P2 Weighing k parameter")
+
+    parser.add_argument("--mask_path", type=str, default=None, help="path to mask images for inpainting, directory")
+    parser.add_argument("--inpa_inj_sched_prev", action="store_true", default=True, help="use previous schedule for inpainting injection")
+    parser.add_argument("--inpa_inj_sched_prev_cumnoise", action="store_true", default=False, help="use cumulative noise for inpainting injection")
+    parser.add_argument("--use_inverse_masks", action="store_true", default=False, help="invert mask values for inpainting")
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, "logs", args.doc)
 

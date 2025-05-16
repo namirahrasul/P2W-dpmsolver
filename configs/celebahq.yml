@@ -90,3 +90,8 @@ sampling:
     fid_batch_size: 1
     cond_class: false
     classifier_scale: 0.0
+    base_samples: "./demo/image"
+    mask_path: "./demo/mask/thick"
+    inpa_inj_sched_prev: true
+    inpa_inj_sched_prev_cumnoise: false
+    use_inverse_masks: false
