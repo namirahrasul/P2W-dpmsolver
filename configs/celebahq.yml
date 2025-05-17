@@ -49,7 +49,7 @@ model:
     #use_checkpoint for gradient checkpointing during training. False to match default value of p2w
     use_fp16: true
     # use_fp16 matches our p2w checkpoint 
-    num_heads: 1
+    num_heads: 8
     #problem: training and sampling in p2w uses default 4, m2s sampling uses 1. grok suggest our_checkpoint actually is 8 and says num_heads =1 will give fastest inference but sacrifice quality
     num_head_channels: 64
     #num_head_channels matches p2w
@@ -69,7 +69,7 @@ model:
     #ema matches p2w where no ema only ema_rate
     ema_rate: 0.9999
     #ema_rate matches p2w default
-    ckpt_dir: "./ddpm_ckpt/celeba/256x256.pt"
+    ckpt_dir: "./ddpm_ckpt/celeba/ema_0.9999_500000.pt"
 
     ##no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
 

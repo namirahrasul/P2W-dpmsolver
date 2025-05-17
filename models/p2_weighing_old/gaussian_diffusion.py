@@ -3,17 +3,30 @@ This code started out as a PyTorch port of Ho et al's diffusion models:
 https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/diffusion_utils_2.py
 
 Docstrings have been added, as well as DDIM sampling and a new collection of beta schedules.
+Training functions:
+training_losses
+_vb_terms_bpd
+_prior_bpd
+calc_bpd_loop
+
+Sampling functions:
+p_sample
+p_sample_loop
+p_sample_loop_progressive
+ddim_sample
+ddim_reverse_sample
+ddim_sample_loop
+ddim_sample_loop_progressive
+
+Rest are used in both
 """
+
 
 import enum
 import math
 
 import numpy as np
 import torch as th
-import torch.nn.functional as F
-from PIL import Image
-import os
-from collections import defaultdict
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
@@ -127,13 +140,13 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        betas1000=None,
+        p2_gamma=0,
+        p2_k=1,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
-        
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -156,13 +169,6 @@ class GaussianDiffusion:
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
-        if betas1000 is not None:
-            betas1000 = np.array(betas1000, dtype=np.float64)
-            alphas1000 = 1.0 - betas1000
-            self.alphas_cumprod1000 = np.cumprod(alphas1000, axis=0)
-            self.sqrt_alphas_cumprod1000 = np.sqrt(self.alphas_cumprod1000)
-            self.sqrt_one_minus_alphas_cumprod1000 = np.sqrt(1.0 - self.alphas_cumprod1000)
-
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (
             betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -181,6 +187,11 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
 
+        # P2 weighting
+        self.p2_gamma = p2_gamma
+        self.p2_k = p2_k
+        self.snr = 1.0 / (1 - self.alphas_cumprod) - 1
+
     def q_mean_variance(self, x_start, t):
         """
         Get the distribution q(x_t | x_0).
@@ -197,15 +208,8 @@ class GaussianDiffusion:
             self.log_one_minus_alphas_cumprod, t, x_start.shape
         )
         return mean, variance, log_variance
-    
-    def add_onestep_noise(self, x_t, t):
-        device = x_t.device
-        noise = th.randn_like(x_t).to(device)
-        betas_tensor = th.from_numpy(self.betas).to(device)
-        x_out = th.sqrt(1. - betas_tensor[t[0]]) * x_t + th.sqrt(betas_tensor[t[0]]) * noise
-        return x_out.to(device)
 
-    def q_sample(self, x_start, t, noise=None, tscale1000=False):
+    def q_sample(self, x_start, t, noise=None):
         """
         Diffuse the data for a given number of diffusion steps.
 
@@ -219,28 +223,11 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         assert noise.shape == x_start.shape
-        if tscale1000:
-            return (
-                _extract_into_tensor(self.sqrt_alphas_cumprod1000, t, x_start.shape) * x_start
-                + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod1000, t, x_start.shape)
-                * noise
-            )
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
             * noise
         )
-        
-    def undo(self, image_before_step, img_after_model, est_x_0, t, debug=False):
-        return self._undo(img_after_model, t)
-
-    def _undo(self, img_out, t):
-        beta = _extract_into_tensor(self.betas, t, img_out.shape)
-
-        img_in_est = th.sqrt(1 - beta) * img_out + \
-            th.sqrt(beta) * th.randn_like(img_out)
-
-        return img_in_est
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
@@ -295,23 +282,37 @@ class GaussianDiffusion:
         B, C = x.shape[:2]
         assert t.shape == (B,)
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-        # print(model_output.shape)
-        # exit(0)
 
-        assert model_output.shape == (B, C * 2, *x.shape[2:])
-        model_output, model_var_values = th.split(model_output, C, dim=1)
-
-        if self.model_var_type == ModelVarType.LEARNED:
-            model_log_variance = model_var_values
-            model_variance = th.exp(model_log_variance)
+        if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+            assert model_output.shape == (B, C * 2, *x.shape[2:])
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            if self.model_var_type == ModelVarType.LEARNED:
+                model_log_variance = model_var_values
+                model_variance = th.exp(model_log_variance)
+            else:
+                min_log = _extract_into_tensor(
+                    self.posterior_log_variance_clipped, t, x.shape
+                )
+                max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+                # The model_var_values is [-1, 1] for [min_var, max_var].
+                frac = (model_var_values + 1) / 2
+                model_log_variance = frac * max_log + (1 - frac) * min_log
+                model_variance = th.exp(model_log_variance)
         else:
-            min_log = _extract_into_tensor(
-                self.posterior_log_variance_clipped, t, x.shape
-            )
-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-            frac = (model_var_values + 1) / 2
-            model_log_variance = frac * max_log + (1 - frac) * min_log
-            model_variance = th.exp(model_log_variance)
+            model_variance, model_log_variance = {
+                # for fixedlarge, we set the initial (log-)variance like so
+                # to get a better decoder log likelihood.
+                ModelVarType.FIXED_LARGE: (
+                    np.append(self.posterior_variance[1], self.betas[1:]),
+                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
+                ),
+                ModelVarType.FIXED_SMALL: (
+                    self.posterior_variance,
+                    self.posterior_log_variance_clipped,
+                ),
+            }[self.model_var_type]
+            model_variance = _extract_into_tensor(model_variance, t, x.shape)
+            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
 
         def process_xstart(x):
             if denoised_fn is not None:
@@ -371,10 +372,10 @@ class GaussianDiffusion:
             - pred_xstart
         ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
 
-    # def _scale_timesteps(self, t):
-    #     if self.rescale_timesteps:
-    #         return t.float() * (1000.0 / self.num_timesteps)
-    #     return t
+    def _scale_timesteps(self, t):
+        if self.rescale_timesteps:
+            return t.float() * (1000.0 / self.num_timesteps)
+        return t
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
@@ -424,14 +425,6 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        model_mask_kwargs=None,
-        meas_fn=None,
-        pred_xstart=None,
-        idx_wall=-1,
-        resizers=None,
-        
-        inpa_inj_sched_prev=True,
-        inpa_inj_sched_prev_cumnoise=False
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -450,43 +443,6 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        noise = th.randn_like(x)
-
-        if inpa_inj_sched_prev:
-
-            if pred_xstart is not None:
-                gt_keep_mask = th.zeros(x.shape).to(x.device)
-                gt_keep_mask[model_mask_kwargs["ref_img"] > 0.] = 1
-                gt_keep_mask[model_mask_kwargs["ref_img"] < 0.] = 0
-                # if gt_keep_mask is None:
-                #     gt_keep_mask = conf.get_inpa_mask(x)
-
-                gt = model_kwargs['ref_img']
-
-                alpha_cumprod = _extract_into_tensor(
-                    self.alphas_cumprod, t, x.shape)
-
-                if inpa_inj_sched_prev_cumnoise:
-                    weighed_gt = self.get_gt_noised(gt, int(t[0].item()))
-                else:
-                    gt_weight = th.sqrt(alpha_cumprod)
-                    gt_part = gt_weight * gt
-
-                    noise_weight = th.sqrt((1 - alpha_cumprod))
-                    noise_part = noise_weight * th.randn_like(x)
-
-                    weighed_gt = gt_part + noise_part
-
-                x = (
-                    gt_keep_mask * (
-                        weighed_gt
-                    )
-                    +
-                    (1 - gt_keep_mask) * (
-                        x
-                    )
-                )
-
         out = self.p_mean_variance(
             model,
             x,
@@ -495,24 +451,17 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
-
+        noise = th.randn_like(x)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        ) 
-
+        )  # no noise when t == 0
         if cond_fn is not None:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
-        sample = out["mean"] + nonzero_mask * \
-            th.exp(0.5 * out["log_variance"]) * noise
-
-        result = {"sample": sample,
-                  "pred_xstart": out["pred_xstart"]}
-
-        return result
-    
     def p_sample_loop(
         self,
         model,
@@ -522,25 +471,8 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        model_mask_kwargs=None,
         device=None,
         progress=False,
-        resizers=None,
-        lamda=1,
-        resample_num=None,
-        range_t=0,
-        
-        t_T=None,
-        n_sample=None,
-        jump_length=None,
-        jump_n_sample=None,
-        jump_interval=None,
-        ilvr_step=5,
-        
-        inpa_inj_sched_prev=True,
-        inpa_inj_sched_prev_cumnoise=False,
-        use_ddim=False,
-        ddim_stride=5,
     ):
         """
         Generate samples from the model.
@@ -570,30 +502,12 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             cond_fn=cond_fn,
             model_kwargs=model_kwargs,
-            model_mask_kwargs=model_mask_kwargs,
             device=device,
             progress=progress,
-            resizers=resizers,
-            range_t=range_t,
-            resample_num=resample_num,
-            lamda=lamda,
-            
-            t_T=t_T,
-            n_sample=n_sample,
-            jump_length=jump_length,
-            jump_n_sample = jump_n_sample,
-            jump_interval=jump_interval,
-            ilvr_step = ilvr_step,
-            
-            inpa_inj_sched_prev=inpa_inj_sched_prev,
-            inpa_inj_sched_prev_cumnoise=inpa_inj_sched_prev_cumnoise,
-            use_ddim=use_ddim,
-            ddim_stride=ddim_stride,
         ):
             final = sample
-
         return final["sample"]
-    
+
     def p_sample_loop_progressive(
         self,
         model,
@@ -603,26 +517,8 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        model_mask_kwargs=None,
-        resizers=None,
-        range_t=None,
-        resample_num=None,
-        lamda=None,
         device=None,
         progress=False,
-        
-        schedule_jump_params=True,
-        t_T=250,
-        n_sample=1,
-        jump_length=1,
-        jump_n_sample=1,
-        jump_interval=9999,
-        ilvr_step=5,
-        
-        inpa_inj_sched_prev=True,
-        inpa_inj_sched_prev_cumnoise=False,
-        use_ddim=False,
-        ddim_stride=5,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -636,158 +532,41 @@ class GaussianDiffusion:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
         if noise is not None:
-            image_after_step = noise
+            img = noise
         else:
-            image_after_step = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
 
-        # debug_steps = conf.pget('debug.num_timesteps')
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
 
-        self.gt_noises = None  # reset for next image
+            indices = tqdm(indices)
 
-
-        pred_xstart = None
-        ilvr_num = 0
-
-        idx_wall = -1
-        sample_idxs = defaultdict(lambda: 0)
-
-        if schedule_jump_params:
-            times = get_schedule_jump(t_T=t_T, n_sample=n_sample, 
-                                      jump_length=jump_length, jump_n_sample=jump_n_sample, jump_interval=jump_interval)
-            if use_ddim:
-                times_jump = []
-                for i in range(len(times)):
-                    if i == 0 or i == len(times)-1:
-                        times_jump.append(times[i])
-                        continue
-                    if times[i] > times[i-1] and times[i] > times[i+1]:
-                        times_jump.append(times[i])
-                    elif times[i] < times[i-1] and times[i] < times[i+1]:
-                        times_jump.append(times[i])
-                        
-                cur = 0
-                while (cur < len(times_jump)-1):
-                    length = times_jump[cur]-times_jump[cur+1]
-                    if length > ddim_stride or length < -ddim_stride:
-                        if length > 0:
-                            t_in = times_jump[cur] - ddim_stride
-                            border = times_jump[cur+1]
-                            while t_in > border:
-                                times_jump.insert(cur+1, t_in)
-                                cur += 1
-                                t_in -= ddim_stride
-                        else:
-                            t_in = times_jump[cur] + ddim_stride
-                            border = times_jump[cur+1]
-                            while t_in < border:
-                                times_jump.insert(cur+1, t_in)
-                                cur += 1
-                                t_in += ddim_stride
-                    cur += 1
-                                    
-                time_pairs = list(zip(times_jump[:-1], times_jump[1:]))
-            else:
-                time_pairs = list(zip(times[:-1], times[1:]))
-            
-            if progress:
-                from tqdm.auto import tqdm
-                time_pairs = tqdm(time_pairs)
-
-            for t_last, t_cur in time_pairs:
-                idx_wall += 1
-                t_last_t = th.tensor([t_last] * shape[0],  # pylint: disable=not-callable
-                                     device=device)
-                t_cur_t = th.tensor([t_cur] * shape[0],  # pylint: disable=not-callable
-                                     device=device)
-
-                if t_cur < t_last:  # reverse
-                    ilvr_num += 1
-                    with th.no_grad():
-                        image_before_step = image_after_step.clone()
-                        if use_ddim:
-                            out = self.ddim_sample(
-                                model,
-                                image_after_step,
-                                t_last_t,
-                                t_cur_t,
-                                clip_denoised=clip_denoised,
-                                denoised_fn=denoised_fn,
-                                cond_fn=cond_fn,
-                                model_kwargs=model_kwargs,
-                                model_mask_kwargs=model_mask_kwargs,
-                                pred_xstart=pred_xstart
-                            )
-                        else:                           
-                            out = self.p_sample(
-                                model,
-                                image_after_step,
-                                t_last_t,
-                                clip_denoised=clip_denoised,
-                                denoised_fn=denoised_fn,
-                                cond_fn=cond_fn,
-                                resizers=resizers,
-                                model_kwargs=model_kwargs,
-                                model_mask_kwargs=model_mask_kwargs,
-                                pred_xstart=pred_xstart
-                            )
-                        
-                        image_after_step = out["sample"]
-                        pred_xstart = out["pred_xstart"]
-                        
-                        yield out
-
-                else:
-                    t_shift = 1
-
-                    image_before_step = image_after_step.clone()
-                    while t_last+t_shift <= t_cur:
-                        image_after_step = self.undo(
-                            image_before_step, image_after_step,
-                            est_x_0=out['pred_xstart'], t=t_last_t+t_shift, debug=False)
-                        t_shift += 1
-                    pred_xstart = out["pred_xstart"]
-                    
-    def ddim_denoise(self, x, i, j, model):
-        n = x.shape[0]
-        xs = [x]
-        x0_preds = []
-        
-        t = (th.ones(n) * i).to(x.device)
-        next_t = (th.ones(n) * j).to(x.device)
-        b = th.tensor(self.betas).to(x.device)
-        at = compute_alpha(b, t.long())
-        at_next = compute_alpha(b, next_t.long())
-        xt = xs[-1]
-        xt = xt.float()
-        model_output = model(xt, self._scale_timesteps(t))
-        model_output, model_var_values = th.split(model_output, 3, dim=1)
-        et = model_output
-        x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
-        x0_preds.append(x0_t)
-        c1 = (0 * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt())
-        c2 = ((1 - at_next) - c1 ** 2).sqrt()
-        xt_next = at_next.sqrt() * x0_t + c1 * th.randn_like(x) + c2 * et
-        xs.append(xt_next)
-        
-        return {
-            "sample": xs[len(xs)-1],
-            "pred_xstart": x0_preds[len(x0_preds)-1],
-        }
-
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.p_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                )
+                yield out
+                img = out["sample"]
 
     def ddim_sample(
         self,
         model,
         x,
         t,
-        s,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        model_mask_kwargs=None,
-        pred_xstart=None,
-        inpa_inj_sched_prev_cumnoise=False,
         eta=0.0,
     ):
         """
@@ -795,36 +574,6 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
-        if pred_xstart is not None:
-            gt_keep_mask = th.zeros(x.shape).to(x.device)
-            gt_keep_mask[model_mask_kwargs["ref_img"] > 0.] = 1
-            gt_keep_mask[model_mask_kwargs["ref_img"] < 0.] = 0
-
-            gt = model_kwargs['ref_img']
-
-            alpha_cumprod = _extract_into_tensor(
-                self.alphas_cumprod, t, x.shape)
-
-            if inpa_inj_sched_prev_cumnoise:
-                weighed_gt = self.get_gt_noised(gt, int(t[0].item()))
-            else:
-                gt_weight = th.sqrt(alpha_cumprod)
-                gt_part = gt_weight * gt
-
-                noise_weight = th.sqrt((1 - alpha_cumprod))
-                noise_part = noise_weight * th.randn_like(x)
-
-                weighed_gt = gt_part + noise_part
-
-            x = (
-                gt_keep_mask * (
-                    weighed_gt
-                )
-                +
-                (1 - gt_keep_mask) * (
-                    x
-                )
-            )
         out = self.p_mean_variance(
             model,
             x,
@@ -840,8 +589,8 @@ class GaussianDiffusion:
         # in case we used x_start or x_prev prediction.
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
-        alpha_bar = _extract_into_tensor(self.alphas_cumprod, s+1, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, s+1, x.shape)
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
         sigma = (
             eta
             * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
@@ -849,12 +598,10 @@ class GaussianDiffusion:
         )
         # Equation 12.
         noise = th.randn_like(x)
-        
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
         )
-        
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
@@ -1083,7 +830,11 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+
+            # P2 weighting
+            weight = _extract_into_tensor(1 / (self.p2_k + self.snr)**self.p2_gamma, t, target.shape)
+            terms["mse"] = mean_flat(weight * (target - model_output) ** 2)
+
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
@@ -1183,88 +934,3 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
-
-
-def _check_times(times, t_0, t_T):
-    # Check end
-    assert times[0] > times[1], (times[0], times[1])
-
-    # Check beginning
-    assert times[-1] == -1, times[-1]
-
-    # Steplength = 1
-    for t_last, t_cur in zip(times[:-1], times[1:]):
-        assert abs(t_last - t_cur) == 1, (t_last, t_cur)
-
-    # Value range
-    for t in times:
-        assert t >= t_0, (t, t_0)
-        assert t <= t_T, (t, t_T)
-
-def compute_alpha(beta, t):
-    beta = th.cat([th.zeros(1).to(beta.device), beta], dim=0)
-    a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
-    return a
-
-def schedule_list(begin_t, end_t, lb, ub):
-    # not include end_t, but include begin_t
-    # assert (begin_t>=lb and begin_t<=ub and end_t>=lb and end_t<=ub)
-    s_list = []
-    t = begin_t
-    if begin_t < end_t:
-        while t < end_t:
-            s_list.append(t)
-            t += 1
-    elif begin_t > end_t:
-        while t > end_t:
-            s_list.append(t)
-            t -= 1
-   
-    return s_list
-
-def get_schedule_jump(t_T, n_sample, jump_length, jump_n_sample, jump_interval=5):
-    result_schedule = []
-    General_schedule = []
-    t_cur = t_T - 1
-    pred_len = t_T // jump_interval
-    num = 0
-    while t_cur >= -1:
-        General_schedule.append(t_cur)
-        t_cur -= jump_interval
-    if General_schedule[-1] != -1:
-        General_schedule.append(-1)
-    
-    # One try, can be modified
-    min_n = jump_n_sample
-    length = len(General_schedule)
-    mid = int(length / 2)
-    delta_up = (jump_n_sample - min_n) / float(mid)
-    delta_down = (min_n - jump_n_sample) / float(length-mid)
-    
-    weight_n_list = []
-
-    for i in range(length):
-        if i == 0 or i == length-1:
-            weight_n_list.append(min_n)
-        elif i < mid:
-            weight_n_list.append(math.floor(min_n + i * delta_up))
-        elif i > mid:
-            weight_n_list.append(math.ceil(jump_n_sample + (i-mid) * delta_down))
-        elif i == mid:
-            weight_n_list.append(jump_n_sample)
-        
-    for i in range(len(General_schedule)):
-        if i-1 >= 0:
-            result_schedule += schedule_list(begin_t=General_schedule[i-1], end_t=General_schedule[i], lb=-1, ub=t_T-1)
-            
-        if i == 0 or i == len(General_schedule) - 1:
-            continue
-            
-        RP_num = weight_n_list[i]
-        while RP_num >= 0:
-            RP_num -= 1
-            result_schedule += schedule_list(begin_t=General_schedule[i], end_t=General_schedule[i]+jump_length, lb=-1, ub=t_T-1)
-            result_schedule += schedule_list(begin_t=General_schedule[i]+jump_length, end_t=General_schedule[i], lb=-1, ub=t_T-1)
-    
-    result_schedule.append(-1)
-    return result_schedule

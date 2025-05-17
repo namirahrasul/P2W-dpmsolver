@@ -28,7 +28,21 @@ packages = [
     "blobfile",
     "numpy<2",
     "tensorboard",
-    "lmdb"
+    "lmdb",
+    "pillow",
+    "lpips",
+    "torchmetrics", 
+    "click",
+    "psutil",
+    "requests",
+    "imageio",
+    "imageio-ffmpeg",
+    "pyspng",
+    "omegaconf",
+    "pytorch_lightning",  # Pin to a version compatible with PyTorch 1.13.1
+    "einops",
+    "taming-transformers",
+    "transformers"
 ]
 
 for package in packages:

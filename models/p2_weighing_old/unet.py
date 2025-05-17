@@ -466,7 +466,6 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
-        
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -632,7 +631,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, ref_img=None):
+    def forward(self, x, timesteps, y=None):
         """
         Apply the model to an input batch.
 
@@ -641,10 +640,10 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        # assert (y is not None) == (
-        #     self.num_classes is not None
-        # ), "must specify y if and only if the model is class-conditional"
-            
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 

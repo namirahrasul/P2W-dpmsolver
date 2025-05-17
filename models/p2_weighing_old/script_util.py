@@ -54,6 +54,8 @@ def model_and_diffusion_defaults():
         attention_resolutions="16,8",
         channel_mult="",
         dropout=0.0,
+        p2_gamma=0,
+        p2_k=1,
         class_cond=False,
         use_checkpoint=False,
         use_scale_shift_norm=True,
@@ -83,6 +85,8 @@ def create_model_and_diffusion(
     num_heads_upsample,
     attention_resolutions,
     dropout,
+    p2_gamma,
+    p2_k,
     diffusion_steps,
     noise_schedule,
     timestep_respacing,
@@ -123,6 +127,8 @@ def create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        p2_gamma=p2_gamma,
+        p2_k=p2_k,
     )
     return model, diffusion
 
@@ -300,6 +306,8 @@ def sr_create_model_and_diffusion(
     use_scale_shift_norm,
     resblock_updown,
     use_fp16,
+    p2_gamma,
+    p2_k,
 ):
     model = sr_create_model(
         large_size,
@@ -327,6 +335,8 @@ def sr_create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
+        p2_gamma=p2_gamma,
+        p2_k=p2_k,
     )
     return model, diffusion
 
@@ -394,10 +404,10 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
+    p2_gamma=0,
+    p2_k=1,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
-    betas1000 = gd.get_named_beta_schedule(noise_schedule, 1000)
-        
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:
@@ -423,7 +433,8 @@ def create_gaussian_diffusion(
         ),
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
-        betas1000=betas1000,
+        p2_gamma=p2_gamma,
+        p2_k=p2_k,
     )
 
 
