@@ -94,4 +94,4 @@ sampling:
     mask_path: "./demo/mask/thick"
     inpa_inj_sched_prev: true
     inpa_inj_sched_prev_cumnoise: false
-    use_inverse_masks: false
+    use_inverse_masks: falses

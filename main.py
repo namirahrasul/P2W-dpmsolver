@@ -15,7 +15,19 @@ from runners.diffusion import Diffusion
 
 torch.set_printoptions(sci_mode=False)
 
-
+def str2bool(v):
+    """
+    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("boolean value expected")
+    
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description=globals()["__doc__"])
 
@@ -132,7 +144,7 @@ def parse_args_and_config():
     parser.add_argument("--mask_path", type=str, default=None, help="path to mask images for inpainting, directory")
     parser.add_argument("--inpa_inj_sched_prev", action="store_true", default=True, help="use previous schedule for inpainting injection")
     parser.add_argument("--inpa_inj_sched_prev_cumnoise", action="store_true", default=False, help="use cumulative noise for inpainting injection")
-    parser.add_argument("--use_inverse_masks", action="store_true", default=False, help="invert mask values for inpainting")
+    parser.add_argument("--use_inverse_masks", type=str2bool, default=False, help="invert mask values for inpainting")
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, "logs", args.doc)
 

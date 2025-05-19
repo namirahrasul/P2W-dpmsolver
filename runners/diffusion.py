@@ -23,6 +23,7 @@ from functions.losses import loss_registry
 from datasets import get_dataset, data_transform, inverse_data_transform
 from functions.ckpt_util import get_ckpt_path
 from evaluate.fid_score import calculate_fid_given_paths
+from models.p2_weighing.image_datasets import load_data
 
 import torchvision.utils as tvu
 
@@ -48,6 +49,28 @@ def load_data_for_worker(base_samples, batch_size, cond_class):
                     res["y"] = torch.from_numpy(np.stack(label_buffer))
                 yield res
                 buffer, label_buffer = [], []
+
+def load_reference(data_dir, batch_size, image_size, class_cond=False):
+    """
+    Load reference images or masks from a directory using load_data.
+    Args:
+        data_dir: Directory containing .png images.
+        batch_size: Number of images per batch.
+        image_size: Target image size (height, width).
+    Yields:
+        Dictionary with 'ref_img' containing a batch of images.
+    """
+    data = load_data(
+        data_dir=data_dir,
+        batch_size=batch_size,
+        image_size=image_size,
+        class_cond=False,
+        deterministic=True,
+        random_flip=False,
+    )
+    for large_batch, model_kwargs in data:
+        model_kwargs["ref_img"] = large_batch
+        yield model_kwargs
 
 def torch2hwcuint8(x, clip=False):
     if clip:
@@ -130,13 +153,13 @@ class Diffusion(object):
             beta_schedule=config.diffusion.beta_schedule,
             beta_start=config.diffusion.beta_start,
             beta_end=config.diffusion.beta_end,
-            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
-        )
+            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps)
         betas = self.betas = torch.from_numpy(betas).float().to(self.device)
         self.num_timesteps = betas.shape[0]
 
         alphas = 1.0 - betas
         alphas_cumprod = alphas.cumprod(dim=0)
+        self.alphas_cumprod = alphas_cumprod
         alphas_cumprod_prev = torch.cat(
             [torch.ones(1).to(device), alphas_cumprod[:-1]], dim=0
         )
@@ -285,9 +308,9 @@ class Diffusion(object):
                 torch.distributed.barrier()
                 if self.rank == 0:
                     print("Begin to compute FID...")
-                    fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=4)
-                    print("FID: {}".format(fid))
-                    np.save(os.path.join(self.args.exp, "fid"), fid)
+                    #fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=4)
+                    #print("FID: {}".format(fid))
+                    #np.save(os.path.join(self.args.exp, "fid"), fid)
         elif self.args.sample_only:
             self.sample_n_images(model, classifier=classifier)
             torch.distributed.barrier()
@@ -311,33 +334,55 @@ class Diffusion(object):
         if self.config.model.is_upsampling:
             base_samples_total = load_data_for_worker(self.args.base_samples, config.sampling.batch_size, config.sampling.cond_class)
 
+        elif self.args.base_samples and self.args.mask_path:
+            ref_data = load_reference(self.args.base_samples, config.sampling.batch_size, config.data.image_size, class_cond=config.sampling.cond_class)
+            mask_data = load_reference(self.args.mask_path, config.sampling.batch_size, config.data.image_size, class_cond=config.sampling.cond_class)
         with torch.no_grad():
-            for _ in tqdm.tqdm(
-                range(n_rounds), desc="Generating image samples for FID evaluation."
-            ):
+            for _ in tqdm.tqdm(range(n_rounds), desc="Generating image samples for FID evaluation."):
                 n = config.sampling.batch_size
-                x = torch.randn(
-                    n,
-                    config.data.channels,
-                    config.data.image_size,
-                    config.data.image_size,
-                    device=self.device,
-                )
-
+                x = torch.randn(n, config.data.channels, config.data.image_size, config.data.image_size, device=self.device)
                 if self.config.model.is_upsampling:
                     base_samples = next(base_samples_total)
+                    model_mask_kwargs = None
+                    ref_samples = None
+                elif self.args.base_samples and self.args.mask_path:
+                    model_mask_kwargs = next(mask_data)
+                    ref_samples = next(ref_data)
+                    model_mask_kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_mask_kwargs.items()}
+                    ref_samples = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in ref_samples.items()}
+                    if self.args.use_inverse_masks:
+                        model_mask_kwargs["ref_img"] = model_mask_kwargs["ref_img"] * (-1)
+                    base_samples = None
                 else:
                     base_samples = None
-
-                x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples)
+                    model_mask_kwargs = None
+                    ref_samples = None
+                x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples, model_kwargs=ref_samples if self.args.base_samples and self.args.mask_path else model_kwargs, model_mask_kwargs=model_mask_kwargs, inpa_inj_sched_prev=self.args.inpa_inj_sched_prev, inpa_inj_sched_prev_cumnoise=self.args.inpa_inj_sched_prev_cumnoise)
                 x = inverse_data_transform(config, x)
-                for i in range(x.shape[0]):
-                    if classes is None:
-                        path = os.path.join(self.args.image_folder, f"{img_id}.png")
-                    else:
-                        path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
-                    tvu.save_image(x.cpu()[i], path)
-                    img_id += 1
+                if model_mask_kwargs is not None:
+                    gt = ref_samples["ref_img"]
+                    mask = model_mask_kwargs["ref_img"]
+                    mask = (mask > 0).float()
+                    tmp_ones = torch.ones_like(gt) * (-1)
+                    input_img = gt * mask + (1 - mask) * tmp_ones
+                    final_img = mask * gt + (1 - mask) * x
+                    os.makedirs(os.path.join(self.args.image_folder, "gtImg"), exist_ok=True)
+                    os.makedirs(os.path.join(self.args.image_folder, "inputImg"), exist_ok=True)
+                    os.makedirs(os.path.join(self.args.image_folder, "sampledImg"), exist_ok=True)
+                    os.makedirs(os.path.join(self.args.image_folder, "outImg"), exist_ok=True)
+                    for i in range(x.shape[0]):
+                        tvu.save_image(inverse_data_transform(config, gt[i]), os.path.join(self.args.image_folder, "gtImg", f"{img_id+i}.png"), nrow=1)
+                        tvu.save_image(inverse_data_transform(config, input_img[i]), os.path.join(self.args.image_folder, "inputImg", f"{img_id+i}.png"), nrow=1)
+                        tvu.save_image(x[i], os.path.join(self.args.image_folder, "sampledImg", f"{img_id+i}.png"), nrow=1)
+                        tvu.save_image(inverse_data_transform(config, final_img[i]), os.path.join(self.args.image_folder, "outImg", f"{img_id+i}.png"), nrow=1)
+                else:
+                    for i in range(x.shape[0]):
+                        if classes is None:
+                            path = os.path.join(self.args.image_folder, f"{img_id}.png")
+                        else:
+                            path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
+                        tvu.save_image(x.cpu()[i], path)
+                img_id += 1
 
     def sample_n_images(self, model, classifier=None):
         config = self.config
@@ -443,7 +488,7 @@ class Diffusion(object):
         for i in range(x.size(0)):
             tvu.save_image(x[i], os.path.join(self.args.image_folder, f"{i}.png"))
 
-    def sample_image(self, x, model, last=True, classifier=None, base_samples=None):
+    def sample_image(self, x, model, last=True, classifier=None, base_samples=None, model_kwargs=None, model_mask_kwargs=None, inpa_inj_sched_prev=True, inpa_inj_sched_prev_cumnoise=False):
         assert last
         try:
             skip = self.args.skip
@@ -453,19 +498,19 @@ class Diffusion(object):
         classifier_scale = self.config.sampling.classifier_scale if self.args.scale is None else self.args.scale
         if self.config.sampling.cond_class:
             if self.args.fixed_class is None:
-                classes = torch.randint(low=0, high=self.config.data.num_classes, size=(x.shape[0],)).to(x.device)
+                classes = torch.randint(low=0, high=self.config.data.num_classes, size=(x.shape[0],)).to(self.device)
             else:
-                classes = torch.randint(low=self.args.fixed_class, high=self.args.fixed_class + 1, size=(x.shape[0],)).to(x.device)
+                classes = torch.randint(low=self.args.fixed_class, high=self.args.fixed_class + 1, size=(x.shape[0],)).to(self.device)
         else:
             classes = None
         
         if base_samples is None:
             if classes is None:
-                model_kwargs = {}
+                model_kwargs = {} if model_kwargs is None else model_kwargs
             else:
-                model_kwargs = {"y": classes}
+                model_kwargs = {"y": classes} if model_kwargs is None else {**model_kwargs, "y": classes}
         else:
-            model_kwargs = {"y": base_samples["y"], "low_res": base_samples["low_res"]}
+            model_kwargs = {"y": base_samples["y"], "low_res": base_samples["low_res"]} if model_kwargs is None else {**model_kwargs, "y": base_samples["y"], "low_res": base_samples["low_res"]}
 
         if self.args.sample_type == "generalized":
             if self.args.skip_type == "uniform":
@@ -488,7 +533,7 @@ class Diffusion(object):
                     if self.config.model.out_channels == 6:
                         return torch.split(out, 3, dim=1)[0]
                 return out
-            xs, _ = generalized_steps(x, seq, model_fn, self.betas, eta=self.args.eta, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=classifier_scale, **model_kwargs)
+            xs, _ = generalized_steps(x, seq, model_fn, self.betas, eta=self.args.eta, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=self.config.sampling.classifier_scale, **model_kwargs)
             x = xs[-1]
         elif self.args.sample_type == "ddpm_noisy":
             if self.args.skip_type == "uniform":
@@ -511,7 +556,7 @@ class Diffusion(object):
                     if self.config.model.out_channels == 6:
                         return torch.split(out, 3, dim=1)[0]
                 return out
-            xs, _ = ddpm_steps(x, seq, model_fn, self.betas, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=classifier_scale, **model_kwargs)
+            xs, _ = ddpm_steps(x, seq, model_fn, self.betas, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=self.config.sampling.classifier_scale, **model_kwargs)
             x = xs[-1]
         elif self.args.sample_type in ["dpmsolver", "dpmsolver++"]:
             from dpm_solver.sampler import NoiseScheduleVP, model_wrapper, DPM_Solver
@@ -527,14 +572,14 @@ class Diffusion(object):
                 log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                 return log_probs[range(len(logits)), y.view(-1)]
 
-            noise_schedule = NoiseScheduleVP(schedule="discrete", betas=self.betas)
+            noise_schedule = NoiseScheduleVP(schedule="discrete", alphas_cumprod=self.alphas_cumprod.to(self.device))
             model_fn_continuous = model_wrapper(
                 model_fn,
                 noise_schedule,
                 model_type="noise",
                 model_kwargs=model_kwargs,
                 guidance_type="uncond" if classifier is None else "classifier",
-                condition=model_kwargs["y"] if "y" in model_kwargs.keys() else None,
+                condition=model_kwargs["y"] if "y" in model_kwargs else None,
                 guidance_scale=classifier_scale,
                 classifier_fn=classifier_fn,
                 classifier_kwargs={},
@@ -556,6 +601,10 @@ class Diffusion(object):
                 solver_type=self.args.dpm_solver_type,
                 atol=self.args.dpm_solver_atol,
                 rtol=self.args.dpm_solver_rtol,
+                model_kwargs=model_kwargs,
+                model_mask_kwargs=model_mask_kwargs,
+                inpa_inj_sched_prev=inpa_inj_sched_prev,
+                inpa_inj_sched_prev_cumnoise=inpa_inj_sched_prev_cumnoise,
             )
         else:
             raise NotImplementedError
