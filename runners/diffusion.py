@@ -358,14 +358,14 @@ class Diffusion(object):
                     model_mask_kwargs = None
                     ref_samples = None
                 x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples, model_kwargs=ref_samples if self.args.base_samples and self.args.mask_path else model_kwargs, model_mask_kwargs=model_mask_kwargs, inpa_inj_sched_prev=self.args.inpa_inj_sched_prev, inpa_inj_sched_prev_cumnoise=self.args.inpa_inj_sched_prev_cumnoise)
-                x = inverse_data_transform(config, x)
+                #x = inverse_data_transform(config, x)
                 if model_mask_kwargs is not None:
                     gt = ref_samples["ref_img"]
                     mask = model_mask_kwargs["ref_img"]
                     mask = (mask > 0).float()
                     tmp_ones = torch.ones_like(gt) * (-1)
                     input_img = gt * mask + (1 - mask) * tmp_ones
-                    final_img = mask * gt + (1 - mask) * x
+                    final_img = mask * input_img + (1 - mask) * x
                     os.makedirs(os.path.join(self.args.image_folder, "gtImg"), exist_ok=True)
                     os.makedirs(os.path.join(self.args.image_folder, "inputImg"), exist_ok=True)
                     os.makedirs(os.path.join(self.args.image_folder, "sampledImg"), exist_ok=True)
