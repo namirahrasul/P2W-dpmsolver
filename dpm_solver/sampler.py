@@ -1081,7 +1081,28 @@ class DPM_Solver:
         intermediates = []
         with torch.no_grad():
             if method == "adaptive":
+                if inpa_inj_sched_prev and model_mask_kwargs is not None:
+                    t_T_tensor = torch.tensor([t_T], device=device, dtype=torch.float16)
+                    print(f"Initial inpainting for adaptive at t={t_T_tensor.item()}")
+                    gt_keep_mask = torch.zeros(x.shape, device=device)
+                    gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
+                    gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
+                    gt = model_kwargs["ref_img"].to(device)
+                    alpha_t = self.noise_schedule.marginal_alpha(t_T_tensor)
+                    sigma_t = self.noise_schedule.marginal_std(t_T_tensor)
+                    if inpa_inj_sched_prev_cumnoise:
+                        weighed_gt = self.get_gt_noised(gt, t_T_tensor)
+                    else:
+                        gt_part = alpha_t * gt
+                        noise_part = sigma_t * torch.randn_like(x)
+                        weighed_gt = gt_part + noise_part
+                    x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                    #self.save_intermediate(x, 0, "after_initial_inpainting", device)
                 x = self.dpm_solver_adaptive(x, order=order, t_T=t_T, t_0=t_0, atol=atol, rtol=rtol, solver_type=solver_type)
+                if self.correcting_xt_fn is not None:
+                    x = self.correcting_xt_fn(x, t_0, 0)
+                if return_intermediate:
+                    intermediates.append(x)
             elif method == "multistep":
                 assert steps >= order
                 timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=steps, device=device)
@@ -1095,7 +1116,7 @@ class DPM_Solver:
                     gt_keep_mask = torch.zeros(x.shape, device=x.device)
                     gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
                     gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
-                    gt = model_kwargs.get('ref_img', torch.zeros_like(x)).to(device)
+                    gt = model_kwargs["ref_img"].to(device)
                     alpha_t = self.noise_schedule.marginal_alpha(t)
                     sigma_t = self.noise_schedule.marginal_std(t)
                     if inpa_inj_sched_prev_cumnoise:
@@ -1105,6 +1126,7 @@ class DPM_Solver:
                         noise_part = sigma_t * torch.randn_like(x)
                         weighed_gt = gt_part + noise_part
                     x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                    #self.save_intermediate(x, step, "after_inpainting", device)
                 model_prev_list = [self.model_fn(x, t)]
                 if self.correcting_xt_fn is not None:
                     x = self.correcting_xt_fn(x, t, step)
@@ -1118,7 +1140,7 @@ class DPM_Solver:
                         gt_keep_mask = torch.zeros(x.shape, device=x.device)
                         gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
                         gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
-                        gt = model_kwargs.get('ref_img', torch.zeros_like(x)).to(device)
+                        gt = model_kwargs["ref_img"].to(device)
                         alpha_t = self.noise_schedule.marginal_alpha(t)
                         sigma_t = self.noise_schedule.marginal_std(t)
                         if inpa_inj_sched_prev_cumnoise:
@@ -1131,6 +1153,7 @@ class DPM_Solver:
                             noise_part = noise_weight * torch.randn_like(x)
                             weighed_gt = gt_part + noise_part
                         x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                        #self.save_intermediate(x, step, "after_inpainting", device)
                     assert len(t_prev_list) >= step, f"t_prev_list has {len(t_prev_list)} elements, need at least {step}"
                     x = self.multistep_dpm_solver_update(x, model_prev_list, t_prev_list, t, step, solver_type=solver_type)
                     if self.correcting_xt_fn is not None:
@@ -1147,7 +1170,7 @@ class DPM_Solver:
                         gt_keep_mask = torch.zeros(x.shape, device=x.device)
                         gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
                         gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
-                        gt = model_kwargs.get('ref_img', torch.zeros_like(x)).to(device)
+                        gt = model_kwargs["ref_img"].to(device)
                         alpha_t = self.noise_schedule.marginal_alpha(t)
                         sigma_t = self.noise_schedule.marginal_std(t)
                         if inpa_inj_sched_prev_cumnoise:
@@ -1160,6 +1183,7 @@ class DPM_Solver:
                             noise_part = noise_weight * torch.randn_like(x)
                             weighed_gt = gt_part + noise_part
                         x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                        #self.save_intermediate(x, step, "after_inpainting", device)
                     if lower_order_final and steps < 10:
                         step_order = min(order, steps + 1 - step)
                     else:
@@ -1183,21 +1207,34 @@ class DPM_Solver:
                     orders = [order,] * K
                     timesteps_outer = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=K, device=device)
                 for step, order in enumerate(orders):
-                    s, t = timesteps_outer[step], timesteps_outer[step + 1]
-                    timesteps_inner = self.get_time_steps(skip_type=skip_type, t_T=s.item(), t_0=t.item(), N=order, device=device)
-                    lambda_inner = self.noise_schedule.marginal_lambda(timesteps_inner)
-                    h = lambda_inner[-1] - lambda_inner[0]
-                    r1 = None if order <= 1 else (lambda_inner[1] - lambda_inner[0]) / h
-                    r2 = None if order <= 2 else (lambda_inner[2] - lambda_inner[0]) / h
-                    # Inpainting logic
-                    if "model_mask_kwargs" in model_kwargs and model_kwargs["model_mask_kwargs"] is not None:
-                        gt_keep_mask = torch.zeros(x.shape, device=x.device)
-                        gt_keep_mask[model_kwargs["model_mask_kwargs"]["ref_img"] > 0.] = 1
-                        gt_keep_mask[model_kwargs["model_mask_kwargs"]["ref_img"] < 0.] = 0
-                        gt = model_kwargs["model_mask_kwargs"]["ref_img"]
+                    t = timesteps_outer[step + 1]  # Use the end timestep for inpainting
+                    # Initial inpainting for singlestep
+                    if inpa_inj_sched_prev and model_mask_kwargs is not None and step == 0:
+                        print(f"Initial inpainting for singlestep at step {step}, t={t}")
+                        gt_keep_mask = torch.zeros(x.shape, device=device)
+                        gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
+                        gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
+                        gt = model_kwargs["ref_img"].to(device)
                         alpha_t = self.noise_schedule.marginal_alpha(t)
                         sigma_t = self.noise_schedule.marginal_std(t)
-                        if model_kwargs.get("inpa_inj_sched_prev_cumnoise", False):
+                        if inpa_inj_sched_prev_cumnoise:
+                            weighed_gt = self.get_gt_noised(gt, t)
+                        else:
+                            gt_part = alpha_t * gt
+                            noise_part = sigma_t * torch.randn_like(x)
+                            weighed_gt = gt_part + noise_part
+                        x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                        #self.save_intermediate(x, step, "after_initial_inpainting", device)
+                    # Inpainting logic before solver update
+                    if inpa_inj_sched_prev and model_mask_kwargs is not None:
+                        print(f"Inpainting for singlestep at step {step}, t={t}")
+                        gt_keep_mask = torch.zeros(x.shape, device=device)
+                        gt_keep_mask[model_mask_kwargs["ref_img"].to(device) > 0.] = 1
+                        gt_keep_mask[model_mask_kwargs["ref_img"].to(device) < 0.] = 0
+                        gt = model_kwargs["ref_img"].to(device)
+                        alpha_t = self.noise_schedule.marginal_alpha(t)
+                        sigma_t = self.noise_schedule.marginal_std(t)
+                        if inpa_inj_sched_prev_cumnoise:
                             weighed_gt = self.get_gt_noised(gt, t)
                         else:
                             gt_weight = alpha_t
@@ -1206,13 +1243,18 @@ class DPM_Solver:
                             noise_part = noise_weight * torch.randn_like(x)
                             weighed_gt = gt_part + noise_part
                         x = gt_keep_mask * weighed_gt + (1 - gt_keep_mask) * x
+                        #self.save_intermediate(x, step, "after_inpainting", device)
+                    s, t = timesteps_outer[step], timesteps_outer[step + 1]
+                    timesteps_inner = self.get_time_steps(skip_type=skip_type, t_T=s.item(), t_0=t.item(), N=order, device=device)
+                    lambda_inner = self.noise_schedule.marginal_lambda(timesteps_inner)
+                    h = lambda_inner[-1] - lambda_inner[0]
+                    r1 = None if order <= 1 else (lambda_inner[1] - lambda_inner[0]) / h
+                    r2 = None if order <= 2 else (lambda_inner[2] - lambda_inner[0]) / h
                     x = self.singlestep_dpm_solver_update(x, s, t, order, solver_type=solver_type, r1=r1, r2=r2)
                     if self.correcting_xt_fn is not None:
                         x = self.correcting_xt_fn(x, t, step)
                     if return_intermediate:
                         intermediates.append(x)
-            else:
-                raise ValueError("Got wrong method {}".format(method))
             if denoise_to_zero:
                 t = torch.ones((1,)).to(device) * t_0
                 # Inpainting logic for denoise_to_zero
