@@ -24,16 +24,14 @@ model:
 #no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
     model_type: "p2-weighing"
     is_upsampling: false
-    image_size_coarse: 64
-    image_size_fine: 256
+    image_size: 256
     in_channels: 3
     model_channels: 128
     out_channels: 6
     num_res_blocks: 1
     attention_resolutions: [16]
     dropout: 0.0
-    channel_mult_coarse: [1, 2, 3, 4]
-    channel_mult_fine: [1, 1, 2, 2, 4, 4]
+    channel_mult: [1, 1, 2, 2, 4, 4]
     conv_resample: true
     dims: 2
     num_classes: null
@@ -50,8 +48,7 @@ model:
     p2_k: 1
     ema: true
     ema_rate: 0.9999
-    ckpt_dir_coarse: "./ddpm_ckpt/celeba/celebahq64_500000.pt"
-    ckpt_dir_fine: "./ddpm_ckpt/celeba/celebahq256_500000.pt"
+    ckpt_dir: "./ddpm_ckpt/celeba/celebahq256_500000.pt"
     
 diffusion:
 #all matches p2w
@@ -70,8 +67,8 @@ sampling:
     fid_batch_size: 1
     cond_class: false
     classifier_scale: 0.0
-    base_samples: "./demo/image"
-    mask_path: "./demo/mask/thick"
+    base_samples: "./demo_split/image"
+    mask_path: "./demo_split/mask/thick"
     inpa_inj_sched_prev: true
     inpa_inj_sched_prev_cumnoise: false
     use_inverse_masks: false
