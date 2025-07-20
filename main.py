@@ -27,7 +27,7 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError("boolean value expected")
-    
+
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description=globals()["__doc__"])
 
@@ -43,8 +43,7 @@ def parse_args_and_config():
         type=str,
         required=False,
         default="",
-        help="A string for documentation purpose. "
-        "Will be the name of the log folder.",
+        help="A string for documentation purpose. Will be the name of the log folder.",
     )
     parser.add_argument(
         "--comment", type=str, default="", help="A string for experiment comment"
@@ -95,11 +94,13 @@ def parse_args_and_config():
         "--base_samples",
         type=str,
         default=None,
-        help=
-        "base samples for upsampling and inpainting, *.npz",
+        help="base samples for upsampling and inpainting, *.npz",
     )
     parser.add_argument(
         "--timesteps", type=int, default=1000, help="number of steps involved"
+    )
+    parser.add_argument(
+        "--timesteps_coarse", type=int, default=1000, help="number of steps for coarse inpainting"
     )
     parser.add_argument(
         "--dpm_solver_order", type=int, default=3, help="order of dpm-solver"
@@ -135,16 +136,15 @@ def parse_args_and_config():
     parser.add_argument("--denoise", action="store_true", default=False)
     parser.add_argument("--lower_order_final", action="store_true", default=False)
     parser.add_argument("--thresholding", action="store_true", default=False)
-    
     parser.add_argument("--sequence", action="store_true")
     parser.add_argument("--port", type=str, default="12355")
     parser.add_argument("--p2_gamma", type=float, default=1.0, help="P2 Weighing gamma parameter")
     parser.add_argument("--p2_k", type=float, default=1.0, help="P2 Weighing k parameter")
-
     parser.add_argument("--mask_path", type=str, default=None, help="path to mask images for inpainting, directory")
     parser.add_argument("--inpa_inj_sched_prev", action="store_true", default=True, help="use previous schedule for inpainting injection")
     parser.add_argument("--inpa_inj_sched_prev_cumnoise", action="store_true", default=False, help="use cumulative noise for inpainting injection")
     parser.add_argument("--use_inverse_masks", type=str2bool, default=False, help="invert mask values for inpainting")
+
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, "logs", args.doc)
 
@@ -152,6 +152,10 @@ def parse_args_and_config():
     with open(os.path.join("configs", args.config), "r") as f:
         config = yaml.safe_load(f)
     new_config = dict2namespace(config)
+
+    # Map model paths from config to args
+    args.model_path_64 = config['model']['ckpt_dir_coarse']
+    args.model_path_256 = config['model']['ckpt_dir_fine']
 
     tb_path = os.path.join(args.exp, "tensorboard", args.doc)
 
@@ -248,7 +252,6 @@ def parse_args_and_config():
 
     return args, new_config
 
-
 def dict2namespace(config):
     namespace = argparse.Namespace()
     for key, value in config.items():
@@ -258,7 +261,6 @@ def dict2namespace(config):
             new_value = value
         setattr(namespace, key, new_value)
     return namespace
-
 
 def main():
     args, config = parse_args_and_config()
@@ -272,13 +274,12 @@ def main():
             nprocs=world_size,
             join=True)
 
-
 def sample(rank, world_size, args, config):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        # set random seed
+    # set random seed
     torch.manual_seed(args.seed + rank)
     np.random.seed(args.seed + rank)
     if torch.cuda.is_available():

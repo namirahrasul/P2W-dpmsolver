@@ -1,3 +1,4 @@
+
 data:
     dataset: "CELEBA"
     category: null
@@ -20,59 +21,40 @@ data:
     # was 1 originally but uncond image generation works with null.
 
 model:
-   ##only problem is matching num_heads to training checkpoint
+#only problem is matching num_heads to training checkpoint
+#no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
     model_type: "p2-weighing"
     is_upsampling: false
-    #is_upsampling matches p2w
-    image_size: 256
-    in_channels: 3 
-    #in channels matches p2w
+    image_size_coarse: 64
+    image_size_fine: 256
+    in_channels: 3
     model_channels: 128
-    #model_channels matches num_channels in p2w
     out_channels: 6
-    #out_channels matches p2w; 3 if learned_sigma=false
     num_res_blocks: 1
-    #num_res_blocks matches p2w
     attention_resolutions: [16]
-    #attention_resolutions matches p2w
+    attention_resolutions_coarse: [4]
     dropout: 0.0
-    #dropout matches p2w
-    channel_mult: [1, 1, 2, 2, 4, 4]
-    #channel_mult matches p2w when image size is 256
+    channel_mult_coarse: [1, 2, 3, 4]
+    channel_mult_fine: [1, 1, 2, 2, 4, 4]
     conv_resample: true
-    # conv_resample matche p2w default but not used since resblock_updown=true
     dims: 2
-    #dims matches p2w for 2d convolution 
     num_classes: null
-    #num_classes null for image generation
     use_checkpoint: false
-    #use_checkpoint for gradient checkpointing during training. False to match default value of p2w
     use_fp16: true
-    # use_fp16 matches our p2w checkpoint 
     num_heads: 8
-    #problem: training and sampling in p2w uses default 4, m2s sampling uses 1. grok suggest our_checkpoint actually is 8 and says num_heads =1 will give fastest inference but sacrifice quality
     num_head_channels: 64
-    #num_head_channels matches p2w
     num_heads_upsample: -1
-    #num_heads_upsample matches p2w default
     use_scale_shift_norm: true
-    #use_scale_shift_norm: matches p2w
     resblock_updown: true
-    #resblock_updown matches p2w
     use_new_attention_order: false
-    #use_new_attention_order matches p2w default
     var_type: fixedlarge
-    #var_type matches p2w for ddim ;p2w learned for ddpm sampling when learned_sigma=true; no learned option in dpmsolver
     p2_gamma: 1
     p2_k: 1
     ema: true
-    #ema matches p2w where no ema only ema_rate
     ema_rate: 0.9999
-    #ema_rate matches p2w default
-    ckpt_dir: "./ddpm_ckpt/celeba/ema_0.9999_500000.pt"
-
-    ##no rescale_learned_sigma in dpmsolver unlike p2w. not needed for sampling but needed in training
-
+    ckpt_dir_coarse: "./ddpm_ckpt/celeba/64_ema_0.9999_1000000.pt"
+    ckpt_dir_fine: "./ddpm_ckpt/celeba/256_ema_0.9999_1000000.pt"
+    
 diffusion:
 #all matches p2w
     beta_schedule: linear
@@ -85,13 +67,23 @@ sampling:
     batch_size: 1
     last_only: True
     fid_stats_dir: "./fid_stats/VIRTUAL_lsun_bedroom256.npz"
-    fid_total_samples: 5
-    total_samples: 5 #for sample_n_images()
+    fid_total_samples: 10
+    total_samples: 10 #for sample_n_images()
     fid_batch_size: 1
     cond_class: false
     classifier_scale: 0.0
-    base_samples: "./demo/image"
-    mask_path: "./demo/mask/thick"
+    base_samples: "./demo_split/celebahq/val"
+    mask_path: "./demo_split/mask/thick"
     inpa_inj_sched_prev: true
     inpa_inj_sched_prev_cumnoise: false
     use_inverse_masks: false
+    thresholding: false
+    n_sample: 1
+    jump_length_coarse: 10
+    jump_n_sample_coarse: 3
+    jump_interval_coarse: 15
+    jump_length_fine: 10
+    jump_n_sample_fine: 3
+    jump_interval_fine: 10
+    ddim_step: 10
+

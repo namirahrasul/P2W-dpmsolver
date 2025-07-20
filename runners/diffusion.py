@@ -2,30 +2,22 @@ import os
 import logging
 import time
 import glob
-from tkinter import E
 
 import blobfile as bf
-
 import numpy as np
 import tqdm
 import torch
 import torch.utils.data as data
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import torchvision.utils as tvu
+import torch.nn.functional as F
 
 from models.p2_weighing.unet import UNetModel as LWDM_Model
-from models.guided_diffusion.unet import UNetModel as GuidedDiffusion_Model
-from models.guided_diffusion.unet import EncoderUNetModel as GuidedDiffusion_Classifier
-from models.guided_diffusion.unet import SuperResModel as GuidedDiffusion_SRModel
-from models.ema import EMAHelper
-from functions import get_optimizer
-from functions.losses import loss_registry
-from datasets import get_dataset, data_transform, inverse_data_transform
-from functions.ckpt_util import get_ckpt_path
-from evaluate.fid_score import calculate_fid_given_paths
 from models.p2_weighing.image_datasets import load_data
-
-import torchvision.utils as tvu
+from models.p2_weighing import logger
+from dpm_solver.sampler import NoiseScheduleVP, model_wrapper, DPM_Solver
+from metrics_cal import *
+from datasets import get_dataset, data_transform, inverse_data_transform
 
 def load_data_for_worker(base_samples, batch_size, cond_class):
     with bf.BlobFile(base_samples, "rb") as f:
@@ -78,6 +70,13 @@ def torch2hwcuint8(x, clip=False):
     x = (x + 1.0) / 2.0
     return x
 
+def upsample_image(image_tensor, target_size=(256, 256)):
+    image_tensor = (image_tensor + 1) / 2.0
+    image_tensor = image_tensor.clamp(0, 1)
+    upscaled_image_tensor = F.interpolate(image_tensor, size=target_size, mode='bilinear', align_corners=False)
+    upscaled_image_tensor = upscaled_image_tensor * 2.0 - 1
+    return upscaled_image_tensor
+
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     """
     Create a beta schedule that discretizes the given alpha_t_bar function,
@@ -121,7 +120,7 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         )
     elif beta_schedule == "const":
         betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
-    elif beta_schedule == "jsd":  # 1/T, 1/(T-2), ..., 1
+    elif beta_schedule == "jsd": # 1/T, 1/(T-2), ..., 1
         betas = 1.0 / np.linspace(
             num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64
         )
@@ -138,17 +137,13 @@ class Diffusion(object):
         self.args = args
         self.config = config
         if rank is None:
-            device = (
-                torch.device("cuda")
-                if torch.cuda.is_available()
-                else torch.device("cpu")
-            )
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         else:
             device = rank
             self.rank = rank
         self.device = device
 
-        self.model_var_type = config.model.var_type
+        self.model_var_type = self.config.model.var_type 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
             beta_start=config.diffusion.beta_start,
@@ -173,17 +168,80 @@ class Diffusion(object):
         elif self.model_var_type == "fixedsmall":
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
+    def create_dpm_solver(self, model, config, x, base_samples=None, model_kwargs=None, classifier=None, classifier_scale=0.0):
+        """Create a DPM_Solver instance with NoiseScheduleVP and necessary functions for noise addition."""
+
+        # Instantiate NoiseScheduleVP
+        noise_schedule = NoiseScheduleVP(schedule="discrete", alphas_cumprod=self.alphas_cumprod.to(self.device))
+
+        # Handle classifier and conditional sampling (moved verbatim from sample_image)
+        if self.config.sampling.cond_class:
+            if base_samples and "y" in base_samples:
+                classes = base_samples["y"].to(self.device)
+            else:
+                classes = torch.randint(low=0, high=config.data.num_classes, size=(x.shape[0],)).to(self.device)
+        else:
+            classes = None
+
+    # Prepare model_kwargs (moved verbatim from sample_image)
+        if base_samples is None:
+            model_kwargs = {} if model_kwargs is None else model_kwargs
+            if classes is not None:
+                model_kwargs = {**model_kwargs, "y": classes}
+        else:
+            model_kwargs = {"y": base_samples["y"], "low_res": base_samples["low_res"]} if model_kwargs is None else {**model_kwargs, "y": base_samples["y"], "low_res": base_samples["low_res"]}
+
+        # Define model_fn as in sample_image
+        def model_fn(x, t, **model_kwargs):
+            out = model(x, t, **model_kwargs)
+            if self.config.model.out_channels == 6:
+                out = torch.split(out, 3, dim=1)[0]
+            return out
+
+        # Define classifier_fn as in sample_image
+        def classifier_fn(x, t, y, **classifier_kwargs):
+            if classifier is None:
+                return None
+            logits = classifier(x, t)
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            return log_probs[range(len(logits)), y.view(-1)]
+
+        # Create model_fn_continuous as in sample_image
+        model_fn_continuous = model_wrapper(
+            model_fn,
+            noise_schedule,
+            model_type="noise",
+            model_kwargs=model_kwargs,
+            guidance_type="uncond" if classifier is None else "classifier",
+            condition=model_kwargs["y"] if "y" in model_kwargs else None,
+            guidance_scale=0.0,
+            classifier_fn=classifier_fn,
+            classifier_kwargs={},
+        )
+
+        # Instantiate DPM_Solver
+        dpm_solver = DPM_Solver(
+            model_fn_continuous,
+            noise_schedule,
+            algorithm_type=self.args.sample_type,
+            correcting_x0_fn="dynamic_thresholding" if self.config.sampling.thresholding else None
+        )
+        return dpm_solver, noise_schedule, classes, model_kwargs
     def sample(self):
+        start_time = time.time()
+        logger.configure(dir=self.args.image_folder)
+        logger.log("creating model...")
+        #config = self.config
         if self.config.model.model_type == "p2-weighing":
-            model = LWDM_Model(
-                image_size=self.config.model.image_size,
+            model_64 = LWDM_Model(
+                image_size=self.config.model.image_size_coarse,
                 in_channels=self.config.model.in_channels,
                 model_channels=self.config.model.model_channels,
                 out_channels=self.config.model.out_channels,
                 num_res_blocks=self.config.model.num_res_blocks,
-                attention_resolutions=self.config.model.attention_resolutions,
+                attention_resolutions=self.config.model.attention_resolutions_coarse,
                 dropout=self.config.model.dropout,
-                channel_mult=self.config.model.channel_mult,
+                channel_mult=self.config.model.channel_mult_coarse,
                 conv_resample=self.config.model.conv_resample,
                 dims=self.config.model.dims,
                 num_classes=self.config.model.num_classes,
@@ -195,119 +253,228 @@ class Diffusion(object):
                 use_scale_shift_norm=self.config.model.use_scale_shift_norm,
                 resblock_updown=self.config.model.resblock_updown,
                 use_new_attention_order=self.config.model.use_new_attention_order
-                #p2_gamma=self.config.model.p2_gamma,
-                #p2_k=self.config.model.p2_k
             )
-        elif self.config.model.model_type == "guided_diffusion":
-            if self.config.model.is_upsampling:
-                model = GuidedDiffusion_SRModel(
-                    image_size=self.config.model.large_size,
-                    in_channels=self.config.model.in_channels,
-                    model_channels=self.config.model.model_channels,
-                    out_channels=self.config.model.out_channels,
-                    num_res_blocks=self.config.model.num_res_blocks,
-                    attention_resolutions=self.config.model.attention_resolutions,
-                    dropout=self.config.model.dropout,
-                    channel_mult=self.config.model.channel_mult,
-                    conv_resample=self.config.model.conv_resample,
-                    dims=self.config.model.dims,
-                    num_classes=self.config.model.num_classes,
-                    use_checkpoint=self.config.model.use_checkpoint,
-                    use_fp16=self.config.model.use_fp16,
-                    num_heads=self.config.model.num_heads,
-                    num_head_channels=self.config.model.num_head_channels,
-                    num_heads_upsample=self.config.model.num_heads_upsample,
-                    use_scale_shift_norm=self.config.model.use_scale_shift_norm,
-                    resblock_updown=self.config.model.resblock_updown,
-                    use_new_attention_order=self.config.model.use_new_attention_order,
-                )
-            else:
-                model = GuidedDiffusion_Model(
-                    image_size=self.config.model.image_size,
-                    in_channels=self.config.model.in_channels,
-                    model_channels=self.config.model.model_channels,
-                    out_channels=self.config.model.out_channels,
-                    num_res_blocks=self.config.model.num_res_blocks,
-                    attention_resolutions=self.config.model.attention_resolutions,
-                    dropout=self.config.model.dropout,
-                    channel_mult=self.config.model.channel_mult,
-                    conv_resample=self.config.model.conv_resample,
-                    dims=self.config.model.dims,
-                    num_classes=self.config.model.num_classes,
-                    use_checkpoint=self.config.model.use_checkpoint,
-                    use_fp16=self.config.model.use_fp16,
-                    num_heads=self.config.model.num_heads,
-                    num_head_channels=self.config.model.num_head_channels,
-                    num_heads_upsample=self.config.model.num_heads_upsample,
-                    use_scale_shift_norm=self.config.model.use_scale_shift_norm,
-                    resblock_updown=self.config.model.resblock_updown,
-                    use_new_attention_order=self.config.model.use_new_attention_order,
-                )
-
-        model = model.to(self.rank)
-        map_location = {"cuda:%d" % 0: "cuda:%d" % self.rank}
-
-        if "ckpt_dir" in self.config.model.__dict__.keys():
-            ckpt_dir = os.path.expanduser(self.config.model.ckpt_dir)
-            states = torch.load(
-                ckpt_dir,
-                map_location=map_location
+            model_256 = LWDM_Model(
+                image_size=self.config.model.image_size_fine,
+                in_channels=self.config.model.in_channels,
+                model_channels=self.config.model.model_channels,
+                out_channels=self.config.model.out_channels,
+                num_res_blocks=self.config.model.num_res_blocks,
+                attention_resolutions=self.config.model.attention_resolutions,
+                dropout=self.config.model.dropout,
+                channel_mult=self.config.model.channel_mult_fine,
+                conv_resample=self.config.model.conv_resample,
+                dims=self.config.model.dims,
+                num_classes=self.config.model.num_classes,
+                use_checkpoint=self.config.model.use_checkpoint,
+                use_fp16=self.config.model.use_fp16,
+                num_heads=self.config.model.num_heads,
+                num_head_channels=self.config.model.num_head_channels,
+                num_heads_upsample=self.config.model.num_heads_upsample,
+                use_scale_shift_norm=self.config.model.use_scale_shift_norm,
+                resblock_updown=self.config.model.resblock_updown,
+                use_new_attention_order=self.config.model.use_new_attention_order
             )
-            if self.config.model.model_type == "p2-weighing" or self.config.model.model_type == "guided_diffusion":
-                model.load_state_dict(states, strict=True)
+
+            model_64 = model_64.to(self.rank)
+            model_256 = model_256.to(self.rank)
+            map_location = {"cuda:%d" % 0: "cuda:%d" % self.rank}
+
+            if "ckpt_dir_coarse" in self.config.model.__dict__.keys() and "ckpt_dir_fine" in self.config.model.__dict__.keys():
+                ckpt_dir_coarse = os.path.expanduser(self.args.model_path_64)
+                ckpt_dir_fine = os.path.expanduser(self.args.model_path_256)
+                states_coarse = torch.load(
+                    ckpt_dir_coarse,
+                    map_location=map_location
+                )
+                states_fine = torch.load(
+                    ckpt_dir_fine,
+                    map_location=map_location
+                )
+                model_64.load_state_dict(states_coarse, strict=True)
+                model_256.load_state_dict(states_fine, strict=True)
                 if self.config.model.use_fp16:
-                    model.convert_to_fp16()
+                    model_64.convert_to_fp16()
+                    model_256.convert_to_fp16()
             else:
-                model.load_state_dict(states, strict=True)
+                raise NotImplementedError("ckpt_dir_coarse or ckpt_dir_fine not defined")
 
-            if self.config.model.model_type == "p2-weighing":
-                model.load_state_dict(states, strict=True)
-            else:
-                if self.config.model.ema:
-                    ema_helper = EMAHelper(mu=self.config.model.ema_rate)
-                    ema_helper.register(model)
-                    ema_helper.load_state_dict(states[-1])
-                    ema_helper.ema(model)
-                else:
-                    ema_helper = None
+            classifier = None
 
-            if self.config.sampling.cond_class and not self.config.model.is_upsampling:
-                classifier = GuidedDiffusion_Classifier(
-                    image_size=self.config.classifier.image_size,
-                    in_channels=self.config.classifier.in_channels,
-                    model_channels=self.config.classifier.model_channels,
-                    out_channels=self.config.classifier.out_channels,
-                    num_res_blocks=self.config.classifier.num_res_blocks,
-                    attention_resolutions=self.config.classifier.attention_resolutions,
-                    channel_mult=self.config.classifier.channel_mult,
-                    use_fp16=self.config.classifier.use_fp16,
-                    num_head_channels=self.config.classifier.num_head_channels,
-                    use_scale_shift_norm=self.config.classifier.use_scale_shift_norm,
-                    resblock_updown=self.config.classifier.resblock_updown,
-                    pool=self.config.classifier.pool
+            model_64.eval()
+            model_256.eval()
+
+
+            if self.config.model.is_upsampling:
+                base_samples_total = load_data_for_worker(self.args.base_samples, self.config.sampling.batch_size, self.config.sampling.cond_class)
+
+            elif self.args.base_samples and self.args.mask_path:
+                logger.log("loading data...")
+                # Load data for both resolutions
+                ref_data_64 = load_reference(
+                    self.args.base_samples,
+                    self.config.sampling.batch_size,
+                    self.config.model.image_size_coarse,
+                    class_cond=self.config.sampling.cond_class,
                 )
-                ckpt_dir = os.path.expanduser(self.config.classifier.ckpt_dir)
-                states = torch.load(
-                    ckpt_dir,
-                    map_location=map_location,
+                mask_data_64 = load_reference(
+                    self.args.mask_path,
+                    self.config.sampling.batch_size,
+                    self.config.model.image_size_coarse,
+                    class_cond=self.config.sampling.cond_class,
                 )
-                classifier = classifier.to(self.rank)
-                classifier.load_state_dict(states, strict=True)
-                if self.config.classifier.use_fp16:
-                    classifier.convert_to_fp16()
-            else:
-                classifier = None
-        else:
-            raise NotImplementedError("ckpt_dir not defined")
+                ref_data_256 = load_reference(
+                    self.args.base_samples,
+                    self.config.sampling.batch_size,
+                    self.config.model.image_size_fine,
+                    class_cond=self.config.sampling.cond_class,
+                )
+                mask_data_256 = load_reference(
+                    self.args.mask_path,
+                    self.config.sampling.batch_size,
+                    self.config.model.image_size_fine,
+                    class_cond=self.config.sampling.cond_class,
+                )
+                # Metrics initialization
+                metrics_file_path = os.path.join(self.args.image_folder, "metrics_log.txt")
+                lpips_value = 0.
+                coarse_lpips_value = 0.
+                psnr_value = 0.
+                coarse_psnr_value = 0.
+                ssim_value = 0.
+                coarse_ssim_value = 0.
+                l1_value = 0.
+                coarse_l1_value = 0.
 
-        model.eval()
+                # Log conditions
+                with open(metrics_file_path, "a") as metrics_file:
+                    metrics_file.write(f"Condition:\n")
+                    metrics_file.write(f"\tmask_path: {self.args.mask_path}\n")
+                    metrics_file.write(f"\ttimesteps_coarse: {self.args.timesteps_coarse}\n")
+                    metrics_file.write(f"\ttimesteps_fine: {self.args.timesteps}\n")
+                    metrics_file.write(f"\tskip_type: {self.args.skip_type}\n")
+                    metrics_file.write(f"\tsample_type: {self.args.sample_type}\n")
+                    metrics_file.write(f"\n")
+
+                logger.log("creating samples...")
+                count = 0
+                all_items = os.listdir(self.args.base_samples)
+                num_inputs = self.config.sampling.total_N
+                # Define coarse and fine schedule params from config
+                schedule_jump_params_coarse = {
+                    "t_T": self.args.timesteps_coarse,
+                    "n_sample": self.config.sampling.n_sample,
+                    "jump_length": self.config.sampling.jump_length_coarse,
+                    "jump_n_sample": self.config.sampling.jump_n_sample_coarse,
+                    "jump_interval": self.config.sampling.jump_interval_coarse
+                }
+                ddim_step = self.config.sampling.ddim_step
+
+                schedule_jump_params_fine = {
+                    "t_T": self.args.timesteps,
+                    "n_sample": self.config.sampling.n_sample,
+                    "jump_length": self.config.sampling.jump_length_fine,
+                    "jump_n_sample": self.config.sampling.jump_n_sample_fine,
+                    "jump_interval": self.config.sampling.jump_interval_fine
+                }
+
+                while count < num_inputs:
+                    model_mask_kwargs_64 = next(mask_data_64)
+                    model_kwargs_64 = next(ref_data_64)
+                    model_mask_kwargs_64 = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_mask_kwargs_64.items()}
+                    model_kwargs_64 = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs_64.items()}
+                    model_mask_kwargs_256 = next(mask_data_256)
+                    model_kwargs_256 = next(ref_data_256)
+                    model_mask_kwargs_256 = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_mask_kwargs_256.items()}
+                    model_kwargs_256 = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs_256.items()}
+                    gt = model_kwargs_256["ref_img"]
+                    mask = model_mask_kwargs_256["ref_img"]
+                    #print("gt shape: {}".format(gt.shape))
+                    #print("mask shape: {}".format(mask.shape))
+
+                    if self.args.use_inverse_masks:
+                        model_mask_kwargs_64["ref_img"] = model_mask_kwargs_64["ref_img"] * (-1)
+                        model_mask_kwargs_256["ref_img"] = model_mask_kwargs_256["ref_img"] * (-1)
+
+                    base_samples=None
+                    mask = (mask > 0).float()
+                    x_64 = torch.randn(self.config.sampling.batch_size, self.config.data.channels, self.config.model.image_size_coarse, self.config.model.image_size_coarse, device=self.device)
+                    dpm_solver_64, noise_schedule_64, classes_64, _ = self.create_dpm_solver(model_64, self.config, x_64, base_samples, model_kwargs_64, classifier=None, classifier_scale=0.0)
+                    sample_coarse = self.sample_image(x_64, model_64,timesteps=self.args.timesteps_coarse, model_kwargs=model_kwargs_64, model_mask_kwargs=model_mask_kwargs_64, inpa_inj_sched_prev=self.args.inpa_inj_sched_prev, inpa_inj_sched_prev_cumnoise=self.args.inpa_inj_sched_prev_cumnoise, dpm_solver=dpm_solver_64, schedule_jump_params=schedule_jump_params_coarse, ddim_step=ddim_step)
+                    sample_coarse_256 = upsample_image(sample_coarse)
+
+                    #t_T_fine = torch.tensor([self.args.timesteps], device=self.device)
+                    # Prepare noise for fine inpainting using DPM_Solver's add_noise
+                    t_T_fine = torch.tensor([self.args.timesteps] * self.config.sampling.batch_size, device=self.device)
+                    noise = torch.randn_like(sample_coarse_256)
+                    dpm_solver_256, noise_schedule_256, classes_256, _ = self.create_dpm_solver(model_256, self.config, sample_coarse_256, base_samples, model_kwargs_256, classifier=None, classifier_scale=0.0)
+                    noised_coarse_256 = dpm_solver_256.add_noise(sample_coarse_256, t_T_fine, noise)
+
+                    # Update model_kwargs for fine inpainting
+                    model_fine_kwargs = model_kwargs_256
+                    model_fine_kwargs["ref_img"] = sample_coarse_256 * (1 - mask) + model_kwargs_256["ref_img"] * mask 
+                    sample_fine = self.sample_image(noised_coarse_256, model_256,timesteps=self.args.timesteps, model_kwargs=model_fine_kwargs, model_mask_kwargs=model_mask_kwargs_256, inpa_inj_sched_prev=self.args.inpa_inj_sched_prev, inpa_inj_sched_prev_cumnoise=self.args.inpa_inj_sched_prev_cumnoise, dpm_solver=dpm_solver_256, schedule_jump_params=schedule_jump_params_fine, ddim_step=ddim_step)
+                    logger.log("sample_fine completed.") 
+                    # Save images and calculate metrics
+                    for i in range(self.config.sampling.batch_size):
+                        os.makedirs(os.path.join(self.args.image_folder, "gtImg"), exist_ok=True)
+                        os.makedirs(os.path.join(self.args.image_folder, "inputImg"), exist_ok=True)
+                        os.makedirs(os.path.join(self.args.image_folder, "sampledImg"), exist_ok=True)
+                        os.makedirs(os.path.join(self.args.image_folder, "outImg"), exist_ok=True)
+                        os.makedirs(os.path.join(self.args.image_folder, "coarseImg"), exist_ok=True)
+
+                        out_gtImg_path = os.path.join(self.args.image_folder, "gtImg", f"{str(count + i).zfill(4)}.png")
+                        out_inputImg_path = os.path.join(self.args.image_folder, "inputImg", f"{str(count + i).zfill(4)}.png")
+                        out_sampledImg_path = os.path.join(self.args.image_folder, "sampledImg", f"{str(count + i).zfill(4)}.png")
+                        out_outImg_path = os.path.join(self.args.image_folder, "outImg", f"{str(count + i).zfill(4)}.png")
+                        out_coarseImg_path = os.path.join(self.args.image_folder, "coarseImg", f"{str(count + i).zfill(4)}.png")
+
+                        tmp_ones = torch.ones_like(gt[i]) * (-1)
+                        inputImg = gt[i] * mask[i] + (1 - mask[i]) * tmp_ones
+                        sampledImg = sample_fine[i].unsqueeze(0)
+                        outImg = mask[i] * inputImg + (1 - mask[i]) * sampledImg
+                        coarseImg = sample_coarse_256[i].unsqueeze(0)
+                        out_coarseImg = mask[i] * inputImg + (1 - mask[i]) * coarseImg
+                        gtImg = gt[i].reshape(outImg.shape).to(outImg.device)
+
+                        tvu.save_image(inverse_data_transform(self.config, gtImg), out_gtImg_path, nrow=1)
+                        tvu.save_image(inverse_data_transform(self.config, inputImg), out_inputImg_path, nrow=1)
+                        tvu.save_image(inverse_data_transform(self.config, sampledImg), out_sampledImg_path, nrow=1)
+                        tvu.save_image(inverse_data_transform(self.config, outImg), out_outImg_path, nrow=1)
+                        tvu.save_image(inverse_data_transform(self.config, out_coarseImg), out_coarseImg_path, nrow=1)
+
+                    count += self.config.sampling.batch_size
+                    with open(metrics_file_path, "a") as metrics_file:
+                        metrics_file.write(f"Coarse {count} samples LPIPS: {coarse_lpips_value / count:.4f}\n")
+                        metrics_file.write(f"Coarse {count} samples PSNR: {coarse_psnr_value / count:.4f}\n")
+                        metrics_file.write(f"Coarse {count} samples SSIM: {coarse_ssim_value / count:.4f}\n")
+                        metrics_file.write(f"Coarse {count} samples L1(%): {coarse_l1_value / count * 100:.2f}\n")
+                        metrics_file.write(f"{count} samples LPIPS: {lpips_value / count:.4f}\n")
+                        metrics_file.write(f"{count} samples PSNR: {psnr_value / count:.4f}\n")
+                        metrics_file.write(f"{count} samples SSIM: {ssim_value / count:.4f}\n")
+                        metrics_file.write(f"{count} samples L1(%): {l1_value / count * 100:.2f}\n")
+                        metrics_file.write(f"\n")
+
+                    logger.log(f"created {count} samples")
+
+                logger.log("sampling complete")
+                end_time = time.time()
+                total_time = end_time - start_time
+                each_time = total_time / count
+                logger.log(f"Total time: {total_time}.")
+                logger.log(f"Each time: {each_time}.")
+                #metrics_file.write(f"{total_time}s for {count} samples\n")
+                #metrics_file.write(f"{each_time}s for 1 sample\n")
+                #metrics_file.write(f"\n")
+            else:
+                raise NotImplementedError("Base sample or mask path not defined")
 
         if self.args.fid:
             if not os.path.exists(os.path.join(self.args.exp, "fid.npy")):
-                self.sample_fid(model, classifier=classifier)
+                self.sample_fid(model_64, model_256, classifier=classifier)
                 torch.distributed.barrier()
                 if self.rank == 0:
-                    print("Begin to compute FID...")
+                    print("Computed FID...")
                     #fid = calculate_fid_given_paths((self.config.sampling.fid_stats_dir, self.args.image_folder), batch_size=self.config.sampling.fid_batch_size, device=self.device, dims=2048, num_workers=4)
                     #print("FID: {}".format(fid))
                     #np.save(os.path.join(self.args.exp, "fid"), fid)
@@ -316,299 +483,36 @@ class Diffusion(object):
             torch.distributed.barrier()
             if self.rank == 0:
                 print("Begin to compute samples...")
-        else:
-            raise NotImplementedError("Sample procedure not defined")
-
-    def sample_fid(self, model, classifier=None):
-        config = self.config
-        total_n_samples = config.sampling.fid_total_samples
-        world_size = torch.cuda.device_count()
-        if total_n_samples % config.sampling.batch_size != 0:
-            raise ValueError("Total samples for sampling must be divided exactly by config.sampling.batch_size, but got {} and {}".format(total_n_samples, config.sampling.batch_size))
-        if len(glob.glob(f"{self.args.image_folder}/*.png")) == total_n_samples:
-            return
-        else:
-            n_rounds = total_n_samples // config.sampling.batch_size // world_size
-        img_id = self.rank * total_n_samples // world_size
-
-        if self.config.model.is_upsampling:
-            base_samples_total = load_data_for_worker(self.args.base_samples, config.sampling.batch_size, config.sampling.cond_class)
-
-        elif self.args.base_samples and self.args.mask_path:
-            ref_data = load_reference(self.args.base_samples, config.sampling.batch_size, config.data.image_size, class_cond=config.sampling.cond_class)
-            mask_data = load_reference(self.args.mask_path, config.sampling.batch_size, config.data.image_size, class_cond=config.sampling.cond_class)
-        with torch.no_grad():
-            for _ in tqdm.tqdm(range(n_rounds), desc="Generating image samples for FID evaluation."):
-                n = config.sampling.batch_size
-                x = torch.randn(n, config.data.channels, config.data.image_size, config.data.image_size, device=self.device)
-                if self.config.model.is_upsampling:
-                    base_samples = next(base_samples_total)
-                    model_mask_kwargs = None
-                    ref_samples = None
-                elif self.args.base_samples and self.args.mask_path:
-                    model_mask_kwargs = next(mask_data)
-                    ref_samples = next(ref_data)
-                    model_mask_kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in model_mask_kwargs.items()}
-                    ref_samples = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in ref_samples.items()}
-                    if self.args.use_inverse_masks:
-                        model_mask_kwargs["ref_img"] = model_mask_kwargs["ref_img"] * (-1)
-                    base_samples = None
-                else:
-                    base_samples = None
-                    model_mask_kwargs = None
-                    ref_samples = None
-                x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples, model_kwargs=ref_samples if self.args.base_samples and self.args.mask_path else model_kwargs, model_mask_kwargs=model_mask_kwargs, inpa_inj_sched_prev=self.args.inpa_inj_sched_prev, inpa_inj_sched_prev_cumnoise=self.args.inpa_inj_sched_prev_cumnoise)
-                #x = inverse_data_transform(config, x)
-                if model_mask_kwargs is not None:
-                    gt = ref_samples["ref_img"]
-                    mask = model_mask_kwargs["ref_img"]
-                    mask = (mask > 0).float()
-                    tmp_ones = torch.ones_like(gt) * (-1)
-                    input_img = gt * mask + (1 - mask) * tmp_ones
-                    final_img = mask * input_img + (1 - mask) * x
-                    os.makedirs(os.path.join(self.args.image_folder, "gtImg"), exist_ok=True)
-                    os.makedirs(os.path.join(self.args.image_folder, "inputImg"), exist_ok=True)
-                    os.makedirs(os.path.join(self.args.image_folder, "sampledImg"), exist_ok=True)
-                    os.makedirs(os.path.join(self.args.image_folder, "outImg"), exist_ok=True)
-                    for i in range(x.shape[0]):
-                        tvu.save_image(inverse_data_transform(config, gt[i]), os.path.join(self.args.image_folder, "gtImg", f"{img_id+i}.png"), nrow=1)
-                        tvu.save_image(inverse_data_transform(config, input_img[i]), os.path.join(self.args.image_folder, "inputImg", f"{img_id+i}.png"), nrow=1)
-                        tvu.save_image(x[i], os.path.join(self.args.image_folder, "sampledImg", f"{img_id+i}.png"), nrow=1)
-                        tvu.save_image(inverse_data_transform(config, final_img[i]), os.path.join(self.args.image_folder, "outImg", f"{img_id+i}.png"), nrow=1)
-                else:
-                    for i in range(x.shape[0]):
-                        if classes is None:
-                            path = os.path.join(self.args.image_folder, f"{img_id}.png")
-                        else:
-                            path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
-                        tvu.save_image(x.cpu()[i], path)
-                img_id += 1
-
-    def sample_n_images(self, model, classifier=None):
-        config = self.config
-        total_n_samples = config.sampling.total_samples
-        world_size = torch.cuda.device_count()
-        if total_n_samples % config.sampling.batch_size != 0:
-            raise ValueError("Total samples for sampling must be divided exactly by config.sampling.batch_size, but got {} and {}".format(total_n_samples, config.sampling.batch_size))
-        if len(glob.glob(f"{self.args.image_folder}/*.png")) == total_n_samples:
-            return
-        else:
-            n_rounds = total_n_samples // config.sampling.batch_size // world_size
-        img_id = self.rank * total_n_samples // world_size
-
-        if self.config.model.is_upsampling:
-            base_samples_total = load_data_for_worker(self.args.base_samples, config.sampling.batch_size, config.sampling.cond_class)
-
-        with torch.no_grad():
-            for _ in tqdm.tqdm(
-                range(n_rounds), desc="Generating image samples for FID evaluation."
-            ):
-                n = config.sampling.batch_size
-                x = torch.randn(
-                    n,
-                    config.data.channels,
-                    config.data.image_size,
-                    config.data.image_size,
-                    device=self.device,
-                )
-
-                if self.config.model.is_upsampling:
-                    base_samples = next(base_samples_total)
-                else:
-                    base_samples = None
-
-                x, classes = self.sample_image(x, model, classifier=classifier, base_samples=base_samples)
-                x = inverse_data_transform(config, x)
-                for i in range(x.shape[0]):
-                    if classes is None:
-                        path = os.path.join(self.args.image_folder, f"{img_id}.png")
-                    else:
-                        path = os.path.join(self.args.image_folder, f"{img_id}_{int(classes.cpu()[i])}.png")
-                    tvu.save_image(x.cpu()[i], path)
-                    img_id += 1
-
-    def sample_sequence(self, model, classifier=None):
-        config = self.config
-
-        x = torch.randn(
-            8,
-            config.data.channels,
-            config.data.image_size,
-            config.data.image_size,
-            device=self.device,
-        )
-
-        with torch.no_grad():
-            _, x = self.sample_image(x, model, last=False, classifier=classifier)
-
-        x = [inverse_data_transform(config, y) for y in x]
-
-        for i in range(len(x)):
-            for j in range(x[i].size(0)):
-                tvu.save_image(
-                    x[i][j], os.path.join(self.args.image_folder, f"{j}_{i}.png")
-                )
-
-    def sample_interpolation(self, model):
-        config = self.config
-
-        def slerp(z1, z2, alpha):
-            theta = torch.acos(torch.sum(z1 * z2) / (torch.norm(z1) * torch.norm(z2)))
-            return (
-                torch.sin((1 - alpha) * theta) / torch.sin(theta) * z1
-                + torch.sin(alpha * theta) / torch.sin(theta) * z2
-            )
-
-        z1 = torch.randn(
-            1,
-            config.data.channels,
-            config.data.image_size,
-            config.data.image_size,
-            device=self.device,
-        )
-        z2 = torch.randn(
-            1,
-            config.data.channels,
-            config.data.image_size,
-            config.data.image_size,
-            device=self.device,
-        )
-        alpha = torch.arange(0.0, 1.01, 0.1).to(z1.device)
-        z_ = []
-        for i in range(alpha.size(0)):
-            z_.append(slerp(z1, z2, alpha[i]))
-
-        x = torch.cat(z_, dim=0)
-        xs = []
-
-        with torch.no_grad():
-            for i in range(0, x.size(0), 8):
-                xs.append(self.sample_image(x[i : i + 8], model))
-        x = inverse_data_transform(config, torch.cat(xs, dim=0))
-        for i in range(x.size(0)):
-            tvu.save_image(x[i], os.path.join(self.args.image_folder, f"{i}.png"))
-
-    def sample_image(self, x, model, last=True, classifier=None, base_samples=None, model_kwargs=None, model_mask_kwargs=None, inpa_inj_sched_prev=True, inpa_inj_sched_prev_cumnoise=False):
+        #else:
+            #raise NotImplementedError("Sample procedure not defined")
+    def sample_fid(self, model_64,model_256, classifier=None):
+        pass
+    def sample_image(self, x, model, timesteps, last=True, model_kwargs=None, model_mask_kwargs=None, inpa_inj_sched_prev=True, inpa_inj_sched_prev_cumnoise=False, dpm_solver_order=3, skip_type="time_uniform", dpm_solver_method="singlestep", dpm_solver_type="dpmsolver", denoise=False, lower_order_final=False, thresholding=False, atol=0.0078, rtol=0.05, dpm_solver=None, schedule_jump_params=None, ddim_step=None):
         assert last
-        try:
-            skip = self.args.skip
-        except Exception:
-            skip = 1
-
-        classifier_scale = self.config.sampling.classifier_scale if self.args.scale is None else self.args.scale
-        if self.config.sampling.cond_class:
-            if self.args.fixed_class is None:
-                classes = torch.randint(low=0, high=self.config.data.num_classes, size=(x.shape[0],)).to(self.device)
-            else:
-                classes = torch.randint(low=self.args.fixed_class, high=self.args.fixed_class + 1, size=(x.shape[0],)).to(self.device)
-        else:
-            classes = None
-        
-        if base_samples is None:
-            if classes is None:
-                model_kwargs = {} if model_kwargs is None else model_kwargs
-            else:
-                model_kwargs = {"y": classes} if model_kwargs is None else {**model_kwargs, "y": classes}
-        else:
-            model_kwargs = {"y": base_samples["y"], "low_res": base_samples["low_res"]} if model_kwargs is None else {**model_kwargs, "y": base_samples["y"], "low_res": base_samples["low_res"]}
-
-        if self.args.sample_type == "generalized":
-            if self.args.skip_type == "uniform":
-                skip = self.num_timesteps // self.args.timesteps
-                seq = range(0, self.num_timesteps, skip)
-            elif self.args.skip_type == "quad":
-                seq = (
-                    np.linspace(
-                        0, np.sqrt(self.num_timesteps * 0.8), self.args.timesteps
-                    )
-                    ** 2
-                )
-                seq = [int(s) for s in list(seq)]
-            else:
-                raise NotImplementedError
-            from functions.denoising import generalized_steps
-            def model_fn(x, t, **model_kwargs):
-                out = model(x, t, **model_kwargs)
-                if "out_channels" in self.config.model.__dict__.keys():
-                    if self.config.model.out_channels == 6:
-                        return torch.split(out, 3, dim=1)[0]
-                return out
-            xs, _ = generalized_steps(x, seq, model_fn, self.betas, eta=self.args.eta, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=self.config.sampling.classifier_scale, **model_kwargs)
-            x = xs[-1]
-        elif self.args.sample_type == "ddpm_noisy":
-            if self.args.skip_type == "uniform":
-                skip = self.num_timesteps // self.args.timesteps
-                seq = range(0, self.num_timesteps, skip)
-            elif self.args.skip_type == "quad":
-                seq = (
-                    np.linspace(
-                        0, np.sqrt(self.num_timesteps * 0.8), self.args.timesteps
-                    )
-                    ** 2
-                )
-                seq = [int(s) for s in list(seq)]
-            else:
-                raise NotImplementedError
-            from functions.denoising import ddpm_steps
-            def model_fn(x, t, **model_kwargs):
-                out = model(x, t, **model_kwargs)
-                if "out_channels" in self.config.model.__dict__.keys():
-                    if self.config.model.out_channels == 6:
-                        return torch.split(out, 3, dim=1)[0]
-                return out
-            xs, _ = ddpm_steps(x, seq, model_fn, self.betas, classifier=classifier, is_cond_classifier=self.config.sampling.cond_class, classifier_scale=self.config.sampling.classifier_scale, **model_kwargs)
-            x = xs[-1]
-        elif self.args.sample_type in ["dpmsolver", "dpmsolver++"]:
-            from dpm_solver.sampler import NoiseScheduleVP, model_wrapper, DPM_Solver
-            def model_fn(x, t, **model_kwargs):
-                out = model(x, t, **model_kwargs)
-                if "out_channels" in self.config.model.__dict__.keys():
-                    if self.config.model.out_channels == 6:
-                        out = torch.split(out, 3, dim=1)[0]
-                return out
-
-            def classifier_fn(x, t, y, **classifier_kwargs):
-                logits = classifier(x, t)
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                return log_probs[range(len(logits)), y.view(-1)]
-
-            noise_schedule = NoiseScheduleVP(schedule="discrete", alphas_cumprod=self.alphas_cumprod.to(self.device))
-            model_fn_continuous = model_wrapper(
-                model_fn,
-                noise_schedule,
-                model_type="noise",
-                model_kwargs=model_kwargs,
-                guidance_type="uncond" if classifier is None else "classifier",
-                condition=model_kwargs["y"] if "y" in model_kwargs else None,
-                guidance_scale=classifier_scale,
-                classifier_fn=classifier_fn,
-                classifier_kwargs={},
-            )
-            dpm_solver = DPM_Solver(
-                model_fn_continuous,
-                noise_schedule,
-                algorithm_type=self.args.sample_type,
-                correcting_x0_fn="dynamic_thresholding" if self.args.thresholding else None,
-            )
+        #config = self.config
+        # DPM-Solver sampling
+        if self.args.sample_type in ["dpmsolver", "dpmsolver++"]:
             x = dpm_solver.sample(
                 x,
-                steps=(self.args.timesteps - 1 if self.args.denoise else self.args.timesteps),
-                order=self.args.dpm_solver_order,
-                skip_type=self.args.skip_type,
-                method=self.args.dpm_solver_method,
-                lower_order_final=self.args.lower_order_final,
-                denoise_to_zero=self.args.denoise,
-                solver_type=self.args.dpm_solver_type,
-                atol=self.args.dpm_solver_atol,
-                rtol=self.args.dpm_solver_rtol,
+                steps=(timesteps - 1 if denoise else timesteps),
+                order=dpm_solver_order,
+                skip_type=skip_type,
+                method=dpm_solver_method,
+                solver_type=dpm_solver_type,
+                lower_order_final=lower_order_final,
+                denoise_to_zero=denoise,
+                atol=atol,
+                rtol=rtol,
                 model_kwargs=model_kwargs,
                 model_mask_kwargs=model_mask_kwargs,
                 inpa_inj_sched_prev=inpa_inj_sched_prev,
                 inpa_inj_sched_prev_cumnoise=inpa_inj_sched_prev_cumnoise,
+                schedule_jump_params=schedule_jump_params,
+                ddim_step=ddim_step,
             )
         else:
-            raise NotImplementedError
-        return x, classes
+            raise NotImplementedError(f"Sample type {self.args.sample_type} not supported")
 
+        return x
     def test(self):
         pass
