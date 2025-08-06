@@ -42,7 +42,8 @@ packages = [
     "pytorch_lightning",  # Pin to a version compatible with PyTorch 1.13.1
     "einops",
     "taming-transformers",
-    "transformers"
+    "transformers",
+    "safetensors==0.4.3"
 ]
 
 for package in packages:
