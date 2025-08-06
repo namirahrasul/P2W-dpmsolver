@@ -28,7 +28,8 @@ packages = [
     "blobfile",
     "numpy<2",
     "tensorboard",
-    "lmdb"
+    "lmdb",
+    "safetensors==0.4.3"
 ]
 
 for package in packages:
