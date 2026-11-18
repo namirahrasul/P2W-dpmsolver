@@ -1,0 +1,5 @@
+ Found 91 image pairs to evaluate.
+
+
+ Running FID Calculation using pytorch-fid...
+FID   : FID:  226.22874507532504 ↓ (lower is better)
